@@ -454,6 +454,7 @@ async fn local_events_task(
         let subs = vec![
             json!({ "type": "workspace.created" }),
             json!({ "type": "workspace.closed" }),
+            json!({ "type": "tab.closed" }),
             json!({ "type": "pane.closed" }),
             // renaming a mirror tab locally is intent for the remote tab, which
             // converge resolves against the label it last stamped; without this
@@ -478,6 +479,7 @@ async fn local_events_task(
                     // Our own closes are marked beforehand and swallowed here.
                     let key = match e.event.as_str() {
                         "workspace_closed" => Some("workspace_id"),
+                        "tab_closed" => Some("tab_id"),
                         "pane_closed" => Some("pane_id"),
                         _ => None,
                     };

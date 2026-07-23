@@ -60,6 +60,12 @@ pub struct Args {
     /// start and stay in control: writable, no idle release, and sized to the
     /// local pane so it fills. Set by the daemon from per-host config.
     pub always_control: bool,
+    /// forward raw mouse clicks/drags to the remote pty when the foreground looks
+    /// like a TUI. Off by default: the foreground classification is a heuristic
+    /// (herdr's stream doesn't expose the remote app's mouse-tracking state), so a
+    /// misclassified shell would get its prompt garbled by SGR packets. Wheel
+    /// events become semantic `terminal.scroll` regardless of this flag.
+    pub mouse_passthrough: bool,
     /// daemon's ssh ControlMaster socket for this host; foreground polls reuse it
     /// (`ssh -S <path>`) to skip a handshake. None → polls connect directly.
     ///
@@ -89,6 +95,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         control_idle_secs: 3600,
         size_fixed: false,
         always_control: false,
+        mouse_passthrough: false,
         ctl_path: None,
         container: None,
     };
@@ -117,6 +124,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
                     next("--control-idle")?.parse().map_err(|_| err("--control-idle must be a number"))?
             }
             "--always-control" => args.always_control = true,
+            "--mouse-passthrough" => args.mouse_passthrough = true,
             "--ctl-path" => args.ctl_path = Some(next("--ctl-path")?),
             "--container" => container_name = Some(next("--container")?),
             "--container-folder" => container_folder = Some(next("--container-folder")?),
@@ -384,11 +392,17 @@ enum MouseAction {
 /// classification — the remote herdr server knows the real app's mouse mode
 /// and is a better judge than this side's process-name heuristic (e.g. a TUI
 /// that doesn't consume wheel events, like an agent CLI). Non-wheel
-/// clicks/drags keep the existing foreground-based routing.
-fn mouse_action(remote_is_shell: Option<bool>, btn: u32, press: bool) -> MouseAction {
+/// clicks/drags are forwarded only after explicit opt-in and a TUI
+/// classification; otherwise they stay local.
+fn mouse_action(
+    mouse_passthrough: bool,
+    remote_is_shell: Option<bool>,
+    btn: u32,
+    press: bool,
+) -> MouseAction {
     if press && (btn == 64 || btn == 65) {
         MouseAction::Scroll { up: btn == 64 }
-    } else if remote_is_shell == Some(false) {
+    } else if mouse_passthrough && remote_is_shell == Some(false) {
         MouseAction::ForwardRaw
     } else {
         MouseAction::Drop
@@ -412,6 +426,47 @@ fn contains_wheel_press(bytes: &[u8]) -> bool {
 
 fn has_mouse_seq(bytes: &[u8]) -> bool {
     bytes.windows(3).any(|w| w == [0x1b, b'[', b'<'])
+}
+
+/// Longest tail we'll ever hold as an in-progress mouse report. A real SGR
+/// packet is ~12 bytes; the params saturate at u32 so an adversarial stream of
+/// digits can't grow it without bound — past this window we give up and let the
+/// bytes flow rather than buffer forever.
+const MAX_MOUSE_LEN: usize = 32;
+
+/// Is `rest` a strict, unterminated prefix of an SGR mouse report
+/// (`ESC [ < (digit|';')*` with no closing `M`/`m`)? Requires the full `ESC[<`
+/// introducer so a bare trailing `ESC` (the Escape key) or `ESC[` (a CSI such as
+/// an arrow key) is never mistaken for a mouse packet and held hostage.
+fn is_partial_mouse(rest: &[u8]) -> bool {
+    rest.len() >= 3
+        && rest[0] == 0x1b
+        && rest[1] == b'['
+        && rest[2] == b'<'
+        && rest[3..].iter().all(|&b| b.is_ascii_digit() || b == b';')
+}
+
+/// Index where a trailing, incomplete SGR mouse report begins, or `bytes.len()`
+/// when the buffer does not end mid-report. A terminal read can split a mouse
+/// packet anywhere; the bytes after the split (e.g. `0;53;51M`) would otherwise
+/// be forwarded raw and land as garbage at a remote shell. Callers hold the
+/// returned suffix back and prepend it to the next read so the report reassembles
+/// before it is classified.
+fn incomplete_mouse_suffix(bytes: &[u8]) -> usize {
+    let window = bytes.len().saturating_sub(MAX_MOUSE_LEN);
+    for s in (window..bytes.len()).rev() {
+        if bytes[s] != 0x1b {
+            continue;
+        }
+        // the trailing-most ESC decides it: a complete report parses (the loop in
+        // handle_stdin consumes it), a mouse prefix is held, anything else (a
+        // non-mouse escape) flows through untouched.
+        if parse_mouse(bytes, s).is_some() {
+            return bytes.len();
+        }
+        return if is_partial_mouse(&bytes[s..]) { s } else { bytes.len() };
+    }
+    bytes.len()
 }
 
 
@@ -462,6 +517,10 @@ struct App {
     /// whether the local pane is currently in application cursor mode (?1h), held
     /// to match the remote's so forwarded arrows arrive in the form it expects
     app_cursor_keys: bool,
+    /// bytes of an SGR mouse report split across a terminal read boundary, held
+    /// until the next stdin arrives so the packet reassembles before it is
+    /// classified — otherwise its tail (`0;53;51M`) leaks to the remote as input.
+    mouse_tail: Vec<u8>,
 }
 
 /// minimum spacing between foreground polls — each is an ssh handshake, so we
@@ -730,6 +789,26 @@ impl App {
     }
 
     async fn handle_stdin(&mut self, buf: Vec<u8>) {
+        // Reassemble a mouse report split across terminal reads before anyone
+        // inspects the bytes: prepend the partial held from last time, then hold
+        // back any trailing partial this read ends on. Without this, the tail of a
+        // split packet (`0;53;51M`) is forwarded raw and garbles a remote shell.
+        // Applies to both modes so a split packet can't spuriously take control.
+        let mut buf = if self.mouse_tail.is_empty() {
+            buf
+        } else {
+            let mut joined = std::mem::take(&mut self.mouse_tail);
+            joined.extend_from_slice(&buf);
+            joined
+        };
+        let cut = incomplete_mouse_suffix(&buf);
+        if cut < buf.len() {
+            self.mouse_tail = buf.split_off(cut);
+        }
+        if buf.is_empty() {
+            return; // read was nothing but the start of a mouse packet
+        }
+
         if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
             // no quit key: the wrapper's lifecycle belongs to the hosting pane
             if has_mouse_seq(&buf) {
@@ -788,7 +867,12 @@ impl App {
         let mut scrolls: Vec<serde_json::Value> = Vec::new();
         while i < buf.len() {
             if let Some((btn, x, y, press, len)) = parse_mouse(&buf, i) {
-                match mouse_action(self.remote_is_shell, btn, press) {
+                match mouse_action(
+                    self.args.mouse_passthrough,
+                    self.remote_is_shell,
+                    btn,
+                    press,
+                ) {
                     MouseAction::Scroll { up } => {
                         scrolls.push(json!({
                             "type": "terminal.scroll",
@@ -884,6 +968,7 @@ pub async fn run(args: Args) -> Result<()> {
         // startup leaves the pane in normal cursor mode; the first classification
         // moves it if the remote turns out to be a TUI
         app_cursor_keys: false,
+        mouse_tail: Vec::new(),
     };
     app.connect(if app.args.always_control { Mode::Control } else { Mode::Observe }).await;
 
@@ -999,15 +1084,16 @@ mod tests {
         // remote foreground classified as a TUI (e.g. `claude`) — wheel must
         // still produce a semantic scroll, not a raw forward, or it silently
         // does nothing when the TUI doesn't consume mouse wheel input
-        assert_eq!(mouse_action(Some(false), 64, true), MouseAction::Scroll { up: true });
-        assert_eq!(mouse_action(Some(false), 65, true), MouseAction::Scroll { up: false });
+        assert_eq!(mouse_action(false, Some(false), 64, true), MouseAction::Scroll { up: true });
+        assert_eq!(mouse_action(true, Some(false), 65, true), MouseAction::Scroll { up: false });
         // unclassified/shell foreground: wheel still scrolls
-        assert_eq!(mouse_action(None, 64, true), MouseAction::Scroll { up: true });
-        assert_eq!(mouse_action(Some(true), 65, true), MouseAction::Scroll { up: false });
-        // non-wheel clicks/drags keep the existing foreground-based routing
-        assert_eq!(mouse_action(Some(false), 0, true), MouseAction::ForwardRaw); // TUI click
-        assert_eq!(mouse_action(Some(true), 0, true), MouseAction::Drop); // shell click
-        assert_eq!(mouse_action(None, 0, true), MouseAction::Drop); // unclassified click
+        assert_eq!(mouse_action(false, None, 64, true), MouseAction::Scroll { up: true });
+        assert_eq!(mouse_action(false, Some(true), 65, true), MouseAction::Scroll { up: false });
+        // non-wheel clicks/drags require explicit passthrough and a TUI foreground
+        assert_eq!(mouse_action(true, Some(false), 0, true), MouseAction::ForwardRaw);
+        assert_eq!(mouse_action(false, Some(false), 0, true), MouseAction::Drop);
+        assert_eq!(mouse_action(true, Some(true), 0, true), MouseAction::Drop);
+        assert_eq!(mouse_action(true, None, 0, true), MouseAction::Drop);
     }
 
     #[test]
@@ -1020,6 +1106,44 @@ mod tests {
         assert!(!contains_wheel_press(b"\x1b[<64;10;5m")); // release, not press
         assert!(has_mouse_seq(b"xx\x1b[<0;1;1Myy"));
         assert!(!has_mouse_seq(b"plain text"));
+    }
+
+    /// A mouse report split across a terminal read must be held back, not spilled
+    /// out as raw bytes. `0;53;51M` leaking to a remote shell is the reported bug.
+    #[test]
+    fn splits_a_mouse_report_at_the_read_boundary() {
+        // whole packet: nothing dangling
+        assert_eq!(incomplete_mouse_suffix(b"\x1b[<0;53;51M"), 11);
+        // every prefix that has reached the `ESC[<` introducer is held from its ESC
+        for cut in 3..11 {
+            let partial = &b"\x1b[<0;53;51M"[..cut];
+            assert_eq!(incomplete_mouse_suffix(partial), 0, "cut at {cut}: {partial:?}");
+        }
+        // a complete packet followed by a fresh partial holds only the partial
+        assert_eq!(incomplete_mouse_suffix(b"\x1b[<0;1;1M\x1b[<2;3"), 9);
+        // real input before a dangling packet is preserved; only the tail is held
+        assert_eq!(incomplete_mouse_suffix(b"ls\x1b[<0;5"), 2);
+    }
+
+    /// Bare `ESC` (the Escape key) and `ESC[` (a CSI prefix like an arrow key)
+    /// are NOT mouse introducers, so they must flow through immediately rather
+    /// than being held hostage waiting for a terminator that never comes.
+    #[test]
+    fn does_not_hold_non_mouse_escapes() {
+        assert_eq!(incomplete_mouse_suffix(b"\x1b"), 1); // lone Escape key
+        assert_eq!(incomplete_mouse_suffix(b"\x1b["), 2); // CSI start
+        assert_eq!(incomplete_mouse_suffix(b"\x1b[A"), 3); // up arrow, complete
+        assert_eq!(incomplete_mouse_suffix(b"plain"), 5); // no escape at all
+        assert_eq!(incomplete_mouse_suffix(b""), 0);
+    }
+
+    #[test]
+    fn is_partial_mouse_requires_the_full_introducer() {
+        assert!(is_partial_mouse(b"\x1b[<")); // bare introducer
+        assert!(is_partial_mouse(b"\x1b[<0;53;51")); // introducer + params
+        assert!(!is_partial_mouse(b"\x1b[")); // no `<` yet — ambiguous CSI
+        assert!(!is_partial_mouse(b"\x1b")); // just Escape
+        assert!(!is_partial_mouse(b"\x1b[<0;5x")); // non-param byte breaks it
     }
 
 

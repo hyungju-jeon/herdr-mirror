@@ -73,6 +73,12 @@ pub struct HostConfig {
     /// the local pane so it fills). Default on; ideal for headless remotes. Turn
     /// off per host for a remote a human is actively using directly.
     pub always_control: bool,
+    /// forward raw mouse clicks/drags to a remote TUI. Default off: herdr's stream
+    /// doesn't expose whether the remote app enabled mouse tracking, so the
+    /// streamer can only guess from the foreground process — a wrong guess garbles
+    /// a plain shell's prompt. Opt in per host once that risk is understood. Wheel
+    /// still becomes a semantic scroll regardless.
+    pub mouse_passthrough: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +122,7 @@ struct RawConfig {
     default_host: Option<String>,
     close_remote_on_local_close: Option<bool>,
     always_control: Option<bool>,
+    mouse_passthrough: Option<bool>,
     // toml::Table (preserve_order) keeps declaration order — the first host
     // is the remote-create fallback, so order is user-visible
     #[serde(default)]
@@ -135,6 +142,7 @@ struct RawHost {
     enabled: Option<bool>,
     always_control: Option<bool>,
     api_transport: Option<String>,
+    mouse_passthrough: Option<bool>,
 }
 
 /// Resolve `kind` + its ref fields, rejecting combinations that would silently
@@ -214,6 +222,7 @@ pub fn load_config(candidates: &[PathBuf]) -> Result<MirrorConfig> {
 pub fn parse_config(text: &str) -> Result<MirrorConfig> {
     let raw: RawConfig = toml::from_str(text)?;
     let global_always_control = raw.always_control.unwrap_or(true);
+    let global_mouse_passthrough = raw.mouse_passthrough.unwrap_or(false);
     let mut hosts: Vec<HostConfig> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for (name, value) in raw.hosts {
@@ -249,6 +258,7 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             prefix: h.prefix.unwrap_or_else(|| name.clone()),
             remote_bin: h.remote_bin.unwrap_or_else(|| "~/.local/bin/herdr".into()),
             always_control: h.always_control.unwrap_or(global_always_control),
+            mouse_passthrough: h.mouse_passthrough.unwrap_or(global_mouse_passthrough),
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
             api_transport,
             kind,
@@ -316,6 +326,24 @@ mod tests {
         let b = c.hosts.iter().find(|h| h.name == "b").unwrap();
         assert!(!a.always_control); // inherits global off
         assert!(b.always_control); // per-host override on
+    }
+
+    #[test]
+    fn mouse_passthrough_defaults_off_with_global_and_per_host_override() {
+        // default: off everywhere (a plain shell must never be garbled by a guess)
+        let c = parse_config("[hosts.work]\ntarget = \"work\"\n").unwrap();
+        assert!(!c.hosts[0].mouse_passthrough);
+        // global on, one host opts back out
+        let c = parse_config(
+            "mouse_passthrough = true\n\
+             [hosts.a]\ntarget = \"a\"\n\
+             [hosts.b]\ntarget = \"b\"\nmouse_passthrough = false\n",
+        )
+        .unwrap();
+        let a = c.hosts.iter().find(|h| h.name == "a").unwrap();
+        let b = c.hosts.iter().find(|h| h.name == "b").unwrap();
+        assert!(a.mouse_passthrough); // inherits global on
+        assert!(!b.mouse_passthrough); // per-host override off
     }
 
     #[test]

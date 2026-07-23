@@ -192,16 +192,21 @@ since the native binding no longer covers them.
 
 ### Mouse
 
-Mirror panes adapt to what's running on the remote pane:
+Mirror panes keep the mouse local by default:
 
-- at a **shell**, the mouse stays local — drag-select and copy work natively, and
-  nothing leaks into the prompt;
-- in a **TUI** (vim, htop, lazygit, …), clicks and wheel forward to the app.
+- **wheel** always forwards as a semantic scroll (the server decides app vs
+  scrollback);
+- **clicks and drags** stay local — drag-select and copy work natively, and
+  nothing leaks into a shell prompt.
 
-herdr's streamed frames don't carry the app's mouse mode, so the plugin infers it
-from the remote pane's foreground process — anything that isn't a known shell is
-treated as a mouse-aware TUI. Detection is polled, so after switching between a
-shell and a TUI there's a brief lag before the mouse mode catches up.
+herdr's streamed frames don't carry the remote app's mouse-tracking mode, so the
+plugin can only *guess* whether clicks belong to a TUI (from the foreground
+process) — and a wrong guess garbles a plain shell's command line with raw SGR
+packets. Because that guess isn't reliable, click forwarding to remote TUIs is
+opt-in: set `mouse_passthrough = true` (globally or per host) to forward clicks
+to anything the plugin classifies as a mouse-aware TUI (vim, htop, lazygit, …).
+Detection is polled, so expect a brief lag after switching between a shell and a
+TUI. Leave it off if the host runs shells you type into.
 
 ## Configuration
 
@@ -223,6 +228,11 @@ shell and a TUI there's a brief lag before the mouse mode catches up.
                          # idle release, and sized to your local pane so the
                          # remote fills it (ideal for headless remotes). Set
                          # false for read-only mirrors that escalate on type.
+# mouse_passthrough = false
+                         # default. Clicks/drags stay local (wheel still scrolls).
+                         # Set true to forward clicks to remote TUIs — the plugin
+                         # can only guess the app's mouse mode, so a wrong guess
+                         # would garble a shell prompt; opt in per host you trust.
 
 [hosts.work]
 target = "work"

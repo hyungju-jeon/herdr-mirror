@@ -298,12 +298,30 @@ enum LabelAction {
 ///
 /// `prefix` is `Some` for workspaces, whose mirrors carry the "<prefix>: " form,
 /// and `None` for tabs, which carry the remote's label verbatim.
+/// Strip a leading "[N] " jump-key index (added by numbering plugins such as
+/// herdr-automatic-rename). It is local display decoration, not a rename —
+/// treating it as user intent creates a rename feedback loop with the plugin.
+fn strip_index(label: &str) -> &str {
+    let rest = label.strip_prefix('[').unwrap_or(label);
+    if rest.len() != label.len() {
+        if let Some((digits, tail)) = rest.split_once("] ") {
+            if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+                return tail;
+            }
+        }
+    }
+    label
+}
+
 fn resolve_label(
     prefix: Option<&str>,
     remote_label: &str,
     local_label: &str,
     last_remote: Option<&str>,
 ) -> LabelAction {
+    // Index prefixes on either end are display decoration, not renames.
+    let remote_label = strip_index(remote_label);
+    let local_label = strip_index(local_label);
     let expected = match prefix {
         Some(p) => format!("{p}: {remote_label}"),
         None => remote_label.to_string(),
@@ -311,7 +329,7 @@ fn resolve_label(
     if local_label == expected {
         return LabelAction::InSync;
     }
-    if last_remote != Some(remote_label) {
+    if last_remote.map(strip_index) != Some(remote_label) {
         // remote changed since we last stamped (or no history) — remote wins
         return LabelAction::RestampLocal;
     }
@@ -355,6 +373,7 @@ pub(crate) fn cmd_for_pane(
     let target = host.target.clone();
     let remote_bin = host.remote_bin.clone();
     let always_control = host.always_control;
+    let mouse_passthrough = host.mouse_passthrough;
     let kind = host.kind.clone();
     let docker_bin = host.docker_bin.clone();
     // daemon's ControlMaster socket for this host (see remote.rs); the streamer
@@ -372,6 +391,9 @@ pub(crate) fn cmd_for_pane(
         ];
         if always_control {
             argv.push("--always-control".into());
+        }
+        if mouse_passthrough {
+            argv.push("--mouse-passthrough".into());
         }
         // ssh only: the pane reuses the daemon's ControlMaster for cheap
         // foreground polls. Docker has no ControlMaster, and healing no longer
@@ -630,6 +652,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         .workspaces
         .values()
         .map(|e| e.local_id.clone())
+        .chain(state.tabs.values().map(|e| e.local_id.clone()))
         .chain(state.panes.values().map(|e| e.local_id.clone()))
         .collect();
     let user_closed = match deps.closes.lock() {
@@ -684,6 +707,28 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     }
     for rid in drop_panes {
         state.panes.remove(&rid);
+    }
+    // local tab closed by the user → close the remote tab (its panes go with
+    // it). Without this, a tab close leaves the remote tab running and the
+    // next converge recreates the local tab from the snapshot. Absence without
+    // a user-close event keeps the old behavior (recreate), which is the safe
+    // default for rebuilds/restarts.
+    let mut tab_close_remote: Vec<String> = Vec::new();
+    for (rid, entry) in state.tabs.iter() {
+        if !local_tab_ids.contains(entry.local_id.as_str())
+            && remote_tab_ids.contains(rid.as_str())
+            && close_remote
+            && user_closed.contains(&entry.local_id)
+        {
+            tab_close_remote.push(rid.clone());
+        }
+    }
+    for rid in &tab_close_remote {
+        log.log(&format!("tab mirror for {rid} closed locally — closing remote tab"));
+        if let Err(e) = deps.remote.request("tab.close", json!({ "tab_id": rid })).await {
+            log.log(&format!("remote tab close failed for {rid}: {e}"));
+        }
+        state.tabs.remove(rid);
     }
 
     // 2. remote objects that disappeared → close their mirrors. Explicit
@@ -754,7 +799,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         if mirror_ws_ids.contains(&rws.workspace_id) {
             continue;
         }
-        let label = format!("{}: {}", host.prefix, rws.label);
+        let label = format!("{}: {}", host.prefix, strip_index(&rws.label));
         if state.workspaces.get(&rws.workspace_id).is_some_and(|e| e.is_tombstoned()) {
             continue;
         }
@@ -885,6 +930,11 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
 
     // 4. remote tabs → replicate layout with wrapper commands
     for rtab in &remote_snap.tabs {
+        // just closed on the remote above — the stale snapshot still lists it;
+        // recreating it here would resurrect the tab the user closed
+        if tab_close_remote.iter().any(|r| r == &rtab.tab_id) {
+            continue;
+        }
         let Some(ws_entry) = state.workspaces.get(&rtab.workspace_id).cloned() else { continue };
         if ws_entry.is_tombstoned() {
             continue;
@@ -1463,6 +1513,7 @@ mod tests {
             remote_bin: "~/.local/bin/herdr".into(),
             always_control: true,
             api_transport: crate::config::ApiTransport::Auto,
+            mouse_passthrough: false,
         }
     }
 
@@ -1631,6 +1682,38 @@ mod tests {
             argv[1..],
             ["pane", "vps", "w1:p1", "--remote-bin", "~/.local/bin/herdr", "--ctl-path", "/state/vps.ctl"]
         );
+    }
+
+    /// mouse_passthrough is off by default (absent from argv) and, when on,
+    /// rides after --always-control without disturbing --ctl-path — and must
+    /// round-trip through the pane parser, since they are separate processes.
+    #[test]
+    fn ssh_pane_argv_carries_mouse_passthrough_when_enabled() {
+        let mut host = ssh_host();
+        host.mouse_passthrough = true;
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let argv = cmd("w1:p1");
+        assert_eq!(
+            argv[1..],
+            [
+                "pane",
+                "vps",
+                "w1:p1",
+                "--remote-bin",
+                "~/.local/bin/herdr",
+                "--always-control",
+                "--mouse-passthrough",
+                "--ctl-path",
+                "/state/vps.ctl",
+            ]
+        );
+        let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
+        assert!(parsed.mouse_passthrough);
+        // default host: flag absent, parser defaults to off
+        let base = cmd_for_pane(&ssh_host(), std::path::Path::new("/state"), &HashMap::new());
+        let base_argv = base("w1:p1");
+        assert!(!base_argv.iter().any(|a| a == "--mouse-passthrough"));
+        assert!(!crate::pane::parse_args(&base_argv[2..]).unwrap().mouse_passthrough);
     }
 
     #[test]
