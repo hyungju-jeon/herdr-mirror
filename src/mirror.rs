@@ -46,9 +46,8 @@ pub struct PaneInfo {
     pub pane_id: String,
     pub tab_id: String,
     pub workspace_id: String,
-    /// unread today, but part of the pane wire shape — kept so the struct
-    /// documents what the API actually returns
-    #[allow(dead_code)]
+    /// remote pane label (e.g. the gpu-pane plugin's "gpu-mon"); mirrored onto
+    /// the local pane so borders/identification match the remote
     pub label: Option<String>,
     pub cwd: Option<String>,
     pub foreground_cwd: Option<String>,
@@ -1195,8 +1194,36 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         }
     }
 
-    // remembered ratio agreements for tabs that are gone would otherwise
-    // accumulate in the state file forever
+    // 4b. sync each mirror pane's label to its remote pane's current label.
+    // The gpu-pane plugin renames its monitor pane to "gpu-mon" AFTER splitting
+    // it off, so a pane mirrored before that rename would otherwise never show
+    // the label (and panes added incrementally via pane.split — vs whole-tab
+    // layout.apply, which carries labels — never got one at all). One-way
+    // (remote → local); the daemon doesn't subscribe to pane.renamed, so this
+    // can't loop back.
+    for rp in &remote_snap.panes {
+        let Some(entry) = state.panes.get(&rp.pane_id) else { continue };
+        if entry.is_tombstoned() || !local_pane_ids.contains(entry.local_id.as_str()) {
+            continue;
+        }
+        let remote_label = rp.label.as_deref().unwrap_or("");
+        let local_label = local_snap
+            .panes
+            .iter()
+            .find(|p| p.pane_id == entry.local_id)
+            .and_then(|p| p.label.as_deref())
+            .unwrap_or("");
+        if remote_label != local_label {
+            let label = (!remote_label.is_empty()).then_some(remote_label);
+            let _ = deps
+                .local
+                .request("pane.rename", json!({ "pane_id": entry.local_id, "label": label }))
+                .await;
+        }
+    }
+
+    // Remembered ratio agreements for tabs that are gone would otherwise
+    // accumulate in the state file forever.
     let live_tabs: HashSet<String> = state.tabs.keys().cloned().collect();
     state.ratios.retain(|k, _| k.split('|').next().is_some_and(|t| live_tabs.contains(t)));
 
