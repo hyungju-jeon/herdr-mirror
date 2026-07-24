@@ -360,9 +360,23 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
 async fn has_live_streamer(local: &ApiClient, pane_id: &str) -> Option<bool> {
     let v = local.request("pane.process_info", json!({ "pane_id": pane_id })).await.ok()?;
     let procs = v.pointer("/process_info/foreground_processes")?.as_array()?;
-    Some(procs.iter().any(|p| {
+    // Return Some(false) — "safe to (re-)exec the streamer here" — ONLY when the
+    // pane is sitting at a plain interactive shell prompt (a freshly-created
+    // mirror pane, or a session-restored zombie). Anything else is treated as
+    // alive/unsafe: our own wrapper is obviously live, but so is the streamer's
+    // `ssh` child or a reported agent (claude/codex) — panes whose stdin is
+    // owned by a running session. Typing the `exec …` line into one of those
+    // forwards it to the remote as keystrokes and dumps the launch command into
+    // the user's live agent input. So key off the leaf foreground process:
+    // a shell → no streamer, safe; the wrapper/ssh/agent/anything else → alive.
+    if procs.iter().any(|p| {
         p.get("argv").and_then(|a| a.as_array()).is_some_and(|argv| is_streamer_argv(argv))
-    }))
+    }) {
+        return Some(true); // our wrapper is the foreground — definitely live
+    }
+    let leaf = procs.last()?.get("name")?.as_str()?;
+    // shell prompt → Some(false) (re-exec ok); anything else → Some(true) (leave)
+    Some(!crate::foreground::is_shell(leaf))
 }
 
 /// Is this foreground process one of our pane wrappers?
