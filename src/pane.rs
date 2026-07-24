@@ -534,6 +534,14 @@ struct App {
     /// some events and drop others, so the remote sees motion with no press (or
     /// a release with no press) — a broken drag. None = no drag in progress.
     drag_forward: Option<bool>,
+    /// active text selection in GRID coords as (anchor, head), each (col, row).
+    /// Some = a selection is on screen (reverse-video highlighted). Driven by a
+    /// left-drag; copied to the clipboard via OSC 52 on release — the streamer
+    /// owns this so it works uniformly on every mirror pane, whether or not the
+    /// remote app supports mouse selection.
+    sel: Option<((usize, usize), (usize, usize))>,
+    /// a left-button drag is in progress (extend head on motion, copy on release)
+    sel_dragging: bool,
 }
 
 /// minimum spacing between foreground polls — each is an ssh handshake, so we
@@ -545,6 +553,88 @@ const FG_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 const SETTLE_DELAY: Duration = Duration::from_millis(350);
 
 impl App {
+    // --- streamer-side text selection (left-drag → OSC 52 clipboard copy) ---
+
+    /// Map a 1-based SGR mouse cell to 0-based grid (col, row), applying the same
+    /// scroll offset paint() uses so the selection lines up with what's on screen.
+    fn mouse_to_grid(&self, mcol: u32, mrow: u32) -> (usize, usize) {
+        let (_c, out_rows) = term_size();
+        let bottom = self.grid.content_bottom.max(self.grid.cursor_row);
+        let offset_r = (bottom + 1).saturating_sub(out_rows);
+        let gc = (mcol as usize).saturating_sub(1).min(self.grid.width.saturating_sub(1));
+        let gr = (mrow as usize).saturating_sub(1) + offset_r;
+        (gc, gr)
+    }
+
+    /// Selection normalized so start precedes end in reading order (row, col).
+    fn sel_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
+        let (a, b) = self.sel?;
+        Some(if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) })
+    }
+
+    /// Inclusive [start_col, end_col] the selection covers on grid row `r`.
+    fn sel_row_span(&self, r: usize, a: (usize, usize), b: (usize, usize)) -> Option<(usize, usize)> {
+        if r < a.1 || r > b.1 {
+            return None;
+        }
+        let w = self.grid.width.saturating_sub(1);
+        let start = if r == a.1 { a.0 } else { 0 };
+        let end = if r == b.1 { b.0 } else { w };
+        Some((start.min(w), end.min(w)))
+    }
+
+    /// Selected text, one line per grid row, trailing spaces trimmed.
+    fn selection_text(&self) -> Option<String> {
+        let (a, b) = self.sel_bounds()?;
+        let mut lines = Vec::new();
+        for r in a.1..=b.1 {
+            let (s, e) = self.sel_row_span(r, a, b)?;
+            let mut line = String::new();
+            if let Some(row) = self.grid.rows.get(r) {
+                for c in s..=e {
+                    line.push(row.get(c).and_then(|x| x.as_ref()).map(|cell| cell.ch).unwrap_or(' '));
+                }
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        let text = lines.join("\n");
+        (!text.trim().is_empty()).then_some(text)
+    }
+
+    /// Reverse-video overlay for the current selection, injected into paint().
+    fn selection_overlay(&self, out_cols: usize, out_rows: usize) -> String {
+        let Some((a, b)) = self.sel_bounds() else { return String::new() };
+        let bottom = self.grid.content_bottom.max(self.grid.cursor_row);
+        let offset_r = (bottom + 1).saturating_sub(out_rows);
+        let mut out = String::new();
+        for r in a.1..=b.1 {
+            let tr = r as isize - offset_r as isize;
+            if tr < 0 || tr as usize >= out_rows {
+                continue;
+            }
+            let Some((s, e)) = self.sel_row_span(r, a, b) else { continue };
+            let e = e.min(out_cols.saturating_sub(1));
+            if s > e {
+                continue;
+            }
+            out.push_str(&format!("\x1b[{};{}H\x1b[7m", tr + 1, s + 1));
+            if let Some(row) = self.grid.rows.get(r) {
+                for c in s..=e {
+                    out.push(row.get(c).and_then(|x| x.as_ref()).map(|cell| cell.ch).unwrap_or(' '));
+                }
+            }
+            out.push_str("\x1b[0m");
+        }
+        out
+    }
+
+    /// Copy the current selection to the system clipboard via OSC 52.
+    fn copy_selection(&self) {
+        if let Some(text) = self.selection_text() {
+            write_stdout(&format!("\x1b]52;c;{}\x07", B64.encode(text.as_bytes())));
+        }
+    }
+
     fn paint(&mut self) {
         if !self.tty {
             return;
@@ -555,14 +645,23 @@ impl App {
         }
         let (cols, rows) = term_size();
         let mut out = self.renderer.paint(&self.grid, cols, rows);
+        const SYNC_END: &str = "\x1b[?2026l";
         // inject the prediction overlay inside the synchronized-update block
         let overlay = self.predict.overlay(&self.grid, cols, rows);
         if !overlay.is_empty() {
-            const SYNC_END: &str = "\x1b[?2026l";
             if let Some(pos) = out.rfind(SYNC_END) {
                 out.insert_str(pos, &overlay);
             } else {
                 out.push_str(&overlay);
+            }
+        }
+        // then the selection highlight, so it wins over the cell underneath
+        let sel = self.selection_overlay(cols, rows);
+        if !sel.is_empty() {
+            if let Some(pos) = out.rfind(SYNC_END) {
+                out.insert_str(pos, &sel);
+            } else {
+                out.push_str(&sel);
             }
         }
         write_stdout(&out);
@@ -883,10 +982,51 @@ impl App {
         let mut rest: Vec<u8> = Vec::with_capacity(buf.len());
         let mut i = 0usize;
         let mut scrolls: Vec<serde_json::Value> = Vec::new();
+        let mut sel_repaint = false;
+        let mut typed = false;
         while i < buf.len() {
             if let Some((btn, x, y, press, len)) = parse_mouse(&buf, i) {
                 let is_motion = btn & 32 != 0; // SGR motion flag (drag)
                 let is_wheel = btn & 64 != 0; // wheel up/down/left/right
+                let is_left = !is_wheel && (btn & 0b11) == 0; // low 2 bits: 0 = left
+                // Left button drives a local selection owned by the streamer.
+                if is_left {
+                    if press && !is_motion {
+                        let g = self.mouse_to_grid(x, y);
+                        self.sel = Some((g, g));
+                        self.sel_dragging = true;
+                        self.renderer.invalidate();
+                        sel_repaint = true;
+                    } else if is_motion && self.sel_dragging {
+                        if let Some((a, _)) = self.sel {
+                            self.sel = Some((a, self.mouse_to_grid(x, y)));
+                            self.renderer.invalidate();
+                            sel_repaint = true;
+                        }
+                    } else if !press && self.sel_dragging {
+                        self.sel_dragging = false;
+                        match self.sel {
+                            Some((a, b)) if a != b => {
+                                self.copy_selection();
+                                self.hint("copied to clipboard");
+                            }
+                            _ => {
+                                self.sel = None;
+                                self.renderer.invalidate();
+                            }
+                        }
+                        sel_repaint = true;
+                    }
+                    i += len;
+                    continue;
+                }
+                // Any other button press dismisses a showing selection.
+                if press && self.sel.is_some() {
+                    self.sel = None;
+                    self.renderer.invalidate();
+                    sel_repaint = true;
+                }
+
                 let action = if is_wheel {
                     // Wheel is always semantic, including over a remote TUI.
                     mouse_action(
@@ -939,7 +1079,19 @@ impl App {
             } else {
                 rest.push(buf[i]);
                 i += 1;
+                typed = true; // a real keystroke — dismiss any selection below
             }
+        }
+        // typing dismisses a showing selection (its highlight would go stale over
+        // the changing content); do it before the input is echoed
+        if typed && self.sel.is_some() {
+            self.sel = None;
+            self.sel_dragging = false;
+            self.renderer.invalidate();
+            sel_repaint = true;
+        }
+        if sel_repaint {
+            self.paint();
         }
         for s in scrolls {
             self.send(s).await;
@@ -1019,6 +1171,8 @@ pub async fn run(args: Args) -> Result<()> {
         app_cursor_keys: false,
         mouse_tail: Vec::new(),
         drag_forward: None,
+        sel: None,
+        sel_dragging: false,
     };
     app.connect(if app.args.always_control { Mode::Control } else { Mode::Observe }).await;
 
