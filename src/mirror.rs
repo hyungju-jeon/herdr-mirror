@@ -1541,6 +1541,7 @@ mod tests {
             always_control: true,
             api_transport: crate::config::ApiTransport::Auto,
             mouse_passthrough: false,
+            remote_focus_actions: Vec::new(),
         }
     }
 

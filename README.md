@@ -224,6 +224,16 @@ TUI. Leave it off if the host runs shells you type into.
                          # (e.g. prefix+x) also closes it on the remote. Set
                          # false to only stop mirroring on a local close,
                          # leaving the remote pane and its agent running.
+# remote_focus_actions = []
+                         # plugin actions to invoke on the REMOTE when a mirror
+                         # of this host is focused locally, e.g.
+                         # ["gpu-pane.ensure"]. A headless remote never sees
+                         # workspace.focused (the human is here, not there), so
+                         # remote plugins that self-heal on focus never re-run
+                         # and layout drift there is permanent. Forwarding the
+                         # local focus gives them that tick. Debounced to once
+                         # per 5s per host; also settable per host.
+
 # always_control = true  # default. Mirror panes stay in control: writable, no
                          # idle release, and sized to your local pane so the
                          # remote fills it (ideal for headless remotes). Set

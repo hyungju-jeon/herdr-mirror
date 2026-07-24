@@ -79,6 +79,15 @@ pub struct HostConfig {
     /// a plain shell's prompt. Opt in per host once that risk is understood. Wheel
     /// still becomes a semantic scroll regardless.
     pub mouse_passthrough: bool,
+    /// Remote plugin actions ("plugin.action" ids) to invoke when a mirror of
+    /// this host is focused locally.
+    ///
+    /// A headless remote never sees `workspace.focused` — the human is here,
+    /// not there — so remote plugins that self-heal on focus (herdr-gpu-pane's
+    /// tmux-style converge, say) never re-run, and any layout drift on the
+    /// remote is permanent. Forwarding local focus gives them the
+    /// "client-attached" tick they were designed around.
+    pub remote_focus_actions: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +132,7 @@ struct RawConfig {
     close_remote_on_local_close: Option<bool>,
     always_control: Option<bool>,
     mouse_passthrough: Option<bool>,
+    remote_focus_actions: Option<Vec<String>>,
     // toml::Table (preserve_order) keeps declaration order — the first host
     // is the remote-create fallback, so order is user-visible
     #[serde(default)]
@@ -143,6 +153,7 @@ struct RawHost {
     always_control: Option<bool>,
     api_transport: Option<String>,
     mouse_passthrough: Option<bool>,
+    remote_focus_actions: Option<Vec<String>>,
 }
 
 /// Resolve `kind` + its ref fields, rejecting combinations that would silently
@@ -223,6 +234,7 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
     let raw: RawConfig = toml::from_str(text)?;
     let global_always_control = raw.always_control.unwrap_or(true);
     let global_mouse_passthrough = raw.mouse_passthrough.unwrap_or(false);
+    let global_remote_focus_actions = raw.remote_focus_actions.unwrap_or_default();
     let mut hosts: Vec<HostConfig> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for (name, value) in raw.hosts {
@@ -259,6 +271,9 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             remote_bin: h.remote_bin.unwrap_or_else(|| "~/.local/bin/herdr".into()),
             always_control: h.always_control.unwrap_or(global_always_control),
             mouse_passthrough: h.mouse_passthrough.unwrap_or(global_mouse_passthrough),
+            remote_focus_actions: h
+                .remote_focus_actions
+                .unwrap_or_else(|| global_remote_focus_actions.clone()),
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
             api_transport,
             kind,
