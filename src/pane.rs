@@ -521,6 +521,12 @@ struct App {
     /// until the next stdin arrives so the packet reassembles before it is
     /// classified — otherwise its tail (`0;53;51M`) leaks to the remote as input.
     mouse_tail: Vec<u8>,
+    /// forward-or-local decision latched at a button-press, held for the whole
+    /// drag until the button-up. A drag is press → motion… → release; without a
+    /// latch a classification change (or a poll landing) mid-drag would forward
+    /// some events and drop others, so the remote sees motion with no press (or
+    /// a release with no press) — a broken drag. None = no drag in progress.
+    drag_forward: Option<bool>,
 }
 
 /// minimum spacing between foreground polls — each is an ssh handshake, so we
@@ -867,12 +873,42 @@ impl App {
         let mut scrolls: Vec<serde_json::Value> = Vec::new();
         while i < buf.len() {
             if let Some((btn, x, y, press, len)) = parse_mouse(&buf, i) {
-                match mouse_action(
-                    self.args.mouse_passthrough,
-                    self.remote_is_shell,
-                    btn,
-                    press,
-                ) {
+                let is_motion = btn & 32 != 0; // SGR motion flag (drag)
+                let is_wheel = btn & 64 != 0; // wheel up/down/left/right
+                let action = if is_wheel {
+                    // Wheel is always semantic, including over a remote TUI.
+                    mouse_action(
+                        self.args.mouse_passthrough,
+                        self.remote_is_shell,
+                        btn,
+                        press,
+                    )
+                } else if is_motion || !press {
+                    // A drag keeps the press-time decision through motion and
+                    // release. Without a recorded press, drop the continuation
+                    // rather than forward an orphaned event.
+                    if self.drag_forward == Some(true) {
+                        MouseAction::ForwardRaw
+                    } else {
+                        MouseAction::Drop
+                    }
+                } else {
+                    if self.remote_is_shell.is_none() {
+                        self.spawn_foreground_poll(true);
+                    }
+                    let action = mouse_action(
+                        self.args.mouse_passthrough,
+                        self.remote_is_shell,
+                        btn,
+                        press,
+                    );
+                    self.drag_forward = Some(action == MouseAction::ForwardRaw);
+                    action
+                };
+                if !press && !is_wheel {
+                    self.drag_forward = None; // button-up ends the drag
+                }
+                match action {
                     MouseAction::Scroll { up } => {
                         scrolls.push(json!({
                             "type": "terminal.scroll",
@@ -969,6 +1005,7 @@ pub async fn run(args: Args) -> Result<()> {
         // moves it if the remote turns out to be a TUI
         app_cursor_keys: false,
         mouse_tail: Vec::new(),
+        drag_forward: None,
     };
     app.connect(if app.args.always_control { Mode::Control } else { Mode::Observe }).await;
 
