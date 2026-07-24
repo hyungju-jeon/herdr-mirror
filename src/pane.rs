@@ -510,6 +510,13 @@ struct App {
     /// scheduled delayed re-poll to catch a foreground change the last input just
     /// caused (e.g. quitting a TUI back to a shell); bypasses the throttle
     settle_at: Option<Instant>,
+    /// while the foreground is still unknown (the warm poll at connect raced or
+    /// the host was briefly unreachable), keep re-polling here until we get a
+    /// definitive answer. Without this a pane the user never types in — a
+    /// monitor, a watched agent — stays unclassified forever, and its mouse
+    /// drags are dropped (a None classification never forwards). Self-limiting:
+    /// clears the moment remote_is_shell becomes Some.
+    classify_retry_at: Option<Instant>,
     /// whether the local mouse grab (?1002h) is currently on. Released at a shell
     /// so herdr does native selection/scroll; re-grabbed for a TUI so clicks can
     /// be forwarded.
@@ -681,8 +688,13 @@ impl App {
                     self.pending_input.clear();
                 }
                 self.session = Some(s);
-                // warm the foreground classification before the user mouses
+                // warm the foreground classification before the user mouses, and
+                // arm a retry so a raced/failed warm poll still converges without
+                // waiting for the user to type (mouse alone can't warm it)
                 self.spawn_foreground_poll(false);
+                if m == Mode::Control {
+                    self.classify_retry_at = Some(Instant::now() + Duration::from_millis(600));
+                }
                 // always-control has no release, so no "ctrl+\ to release" hint
                 self.renderer.status(
                     if m == Mode::Control && !self.args.always_control {
@@ -996,6 +1008,7 @@ pub async fn run(args: Args) -> Result<()> {
         pending_input: Vec::new(),
         last_input: Instant::now(),
         hint_clear_at: None,
+        classify_retry_at: None,
         predict: Predictor::new(),
         remote_is_shell: None,
         fg_poll_at: None,
@@ -1029,6 +1042,7 @@ pub async fn run(args: Args) -> Result<()> {
             idle_at,
             app.predict.deadline(),
             app.settle_at,
+            app.classify_retry_at,
         ]);
 
         tokio::select! {
@@ -1041,6 +1055,7 @@ pub async fn run(args: Args) -> Result<()> {
                     // keep the last good classification if a poll failed (None)
                     Some(Msg::Foreground(v)) => if v.is_some() {
                         app.remote_is_shell = v;
+                        app.classify_retry_at = None; // got a definitive answer
                         app.sync_mouse_grab();
                         app.sync_cursor_key_mode();
                     },
@@ -1084,6 +1099,19 @@ pub async fn run(args: Args) -> Result<()> {
                 if app.settle_at.is_some_and(|t| t <= now) {
                     app.settle_at = None;
                     app.spawn_foreground_poll(true); // forced: bypass the throttle
+                }
+                if app.classify_retry_at.is_some_and(|t| t <= now) {
+                    // still unknown → keep retrying (forced) until classified;
+                    // the Foreground handler clears this once an answer lands
+                    if app.remote_is_shell.is_none()
+                        && app.mode == Mode::Control
+                        && app.session.is_some()
+                    {
+                        app.spawn_foreground_poll(true);
+                        app.classify_retry_at = Some(now + Duration::from_millis(1200));
+                    } else {
+                        app.classify_retry_at = None;
+                    }
                 }
                 if app.predict.deadline().is_some_and(|t| t <= now) {
                     app.predict.on_tick(); // wipe timed-out ghosts (no-echo prompts)
