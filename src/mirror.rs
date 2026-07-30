@@ -27,10 +27,11 @@ pub struct WsInfo {
     pub tab_count: Option<u64>,
     pub pane_count: Option<u64>,
     pub active_tab_id: Option<String>,
-    /// custom metadata tokens the remote publishes. `default` on purpose: a
-    /// pre-0.7.4 remote never sends this.
+    /// Custom metadata tokens the remote publishes. `None` means a pre-0.7.4
+    /// remote omitted the field; `Some({})` means the authoritative set is
+    /// empty and previously forwarded tokens must be retracted.
     #[serde(default)]
-    pub tokens: HashMap<String, String>,
+    pub tokens: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -268,6 +269,23 @@ fn map_status(remote: &str) -> &'static str {
 
 pub fn mirror_source(host_name: &str) -> String {
     format!("plugin:mirror:{host_name}")
+}
+
+/// Retract forwarded token names that are absent from the remote token set.
+///
+/// `workspace.report_metadata` merges updates, so tokens that disappeared on
+/// the remote must be sent as `null`; omission would leave closed-tab labels in
+/// the local sidebar. Local-only token names are safe to retract because the
+/// request applies only to this mirror's metadata source.
+fn workspace_token_retractions(
+    remote: &HashMap<String, String>,
+    local: &HashMap<String, String>,
+) -> HashMap<String, Option<String>> {
+    local
+        .keys()
+        .filter(|name| !remote.contains_key(*name))
+        .map(|name| (name.clone(), None))
+        .collect()
 }
 
 /// The server rejects custom_status longer than this.
@@ -930,20 +948,47 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     //     configured locally. Ignored by a pre-0.7.4 local server.
     let source = mirror_source(&host.name);
     for rws in &remote_snap.workspaces {
-        if rws.tokens.is_empty() {
-            continue; // nothing to forward (also the pre-0.7.4 remote case)
-        }
+        let Some(remote_tokens) = rws.tokens.as_ref() else {
+            continue; // pre-0.7.4 remote: absence is not an authoritative empty set
+        };
         let Some(entry) = state.workspaces.get(&rws.workspace_id) else { continue };
         if entry.is_tombstoned() || !local_ws_ids.contains(&entry.local_id) {
             continue;
         }
-        let _ = deps
-            .local
-            .request(
-                "workspace.report_metadata",
-                json!({ "workspace_id": entry.local_id, "source": source, "tokens": rws.tokens }),
-            )
-            .await;
+        let local_tokens = local_snap
+            .workspaces
+            .iter()
+            .find(|ws| ws.workspace_id == entry.local_id)
+            .and_then(|ws| ws.tokens.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let retractions = workspace_token_retractions(remote_tokens, &local_tokens);
+        if !retractions.is_empty() {
+            let _ = deps
+                .local
+                .request(
+                    "workspace.report_metadata",
+                    json!({
+                        "workspace_id": entry.local_id,
+                        "source": source,
+                        "tokens": retractions,
+                    }),
+                )
+                .await;
+        }
+        if !remote_tokens.is_empty() {
+            let _ = deps
+                .local
+                .request(
+                    "workspace.report_metadata",
+                    json!({
+                        "workspace_id": entry.local_id,
+                        "source": source,
+                        "tokens": remote_tokens,
+                    }),
+                )
+                .await;
+        }
     }
 
     // 4. remote tabs → replicate layout with wrapper commands
@@ -1516,6 +1561,10 @@ pub async fn regroup_sidebar(local: &ApiClient, prefixes: &[String], log: &Logge
 mod tests {
     use super::*;
 
+    fn string_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries.iter().map(|(key, value)| ((*key).into(), (*value).into())).collect()
+    }
+
     fn ssh_host() -> HostConfig {
         HostConfig {
             name: "vps".into(),
@@ -1599,6 +1648,49 @@ mod tests {
         panes.insert("p1".into(), tombstoned("l1"));
         panes.insert("p3".into(), tombstoned("l3"));
         assert!(prune_closed(&tree, &panes).is_none());
+    }
+
+    #[test]
+    fn workspace_token_retractions_include_a_closed_remote_tab() {
+        let remote = string_map(&[("t1", "remaining tab"), ("rbranch", "main")]);
+        let local =
+            string_map(&[("t1", "remaining tab"), ("t2", "closed tab"), ("rbranch", "main")]);
+
+        let retractions = workspace_token_retractions(&remote, &local);
+
+        assert_eq!(retractions, HashMap::from([("t2".into(), None)]));
+    }
+
+    #[test]
+    fn authoritative_empty_workspace_tokens_retract_all_local_tokens() {
+        let local = string_map(&[("t1", "closed tab"), ("rbranch", "main")]);
+
+        let retractions = workspace_token_retractions(&HashMap::new(), &local);
+
+        assert_eq!(retractions.get("t1"), Some(&None));
+        assert_eq!(retractions.get("rbranch"), Some(&None));
+    }
+
+    #[test]
+    fn workspace_snapshot_distinguishes_unsupported_from_empty_tokens() {
+        let absent: WsInfo = serde_json::from_value(json!({
+            "workspace_id": "w1",
+            "tab_count": 1,
+            "pane_count": 1,
+            "active_tab_id": "w1:t1"
+        }))
+        .unwrap();
+        let empty: WsInfo = serde_json::from_value(json!({
+            "workspace_id": "w1",
+            "tab_count": 1,
+            "pane_count": 1,
+            "active_tab_id": "w1:t1",
+            "tokens": {}
+        }))
+        .unwrap();
+
+        assert!(absent.tokens.is_none());
+        assert_eq!(empty.tokens, Some(HashMap::new()));
     }
 
     /// Characterization test: the ssh pane argv is a cross-process contract.
