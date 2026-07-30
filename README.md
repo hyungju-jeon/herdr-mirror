@@ -321,6 +321,13 @@ Locally, name it in a sidebar row (`~/.config/herdr/config.toml`):
 rows = [["state_icon", "workspace"], ["state_text", "agent"], ["$rcwd"]]
 ```
 
+## Layout geometry
+
+Pane order and split ratios reconcile in both directions. A remote split side
+that is at most eight cells wide or tall is treated as a fixed-size strip:
+for example, a five-row monitor stays five rows in a taller local window
+instead of growing to preserve its percentage.
+
 ## Limitations
 
 - **Version-locked to preview** until the `terminal session` streams reach

@@ -446,6 +446,13 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// `(width, height)` of the tab area containing `pane_id`, in terminal cells.
+async fn pane_area(api: &ApiClient, pane_id: &str) -> Option<(f64, f64)> {
+    let value = api.request("pane.layout", json!({ "pane_id": pane_id })).await.ok()?;
+    let area = value.pointer("/layout/area")?;
+    Some((area.get("width")?.as_f64()?, area.get("height")?.as_f64()?))
+}
+
 /// Reconcile one mirrored tab's geometry: exchange panes into the arrangement
 /// the remote has, then merge every split ratio three ways so a resize
 /// propagates in whichever direction it was actually made.
@@ -511,6 +518,29 @@ async fn reconcile_tab_geometry(
         return;
     }
 
+    // Fixed-size remote strips (for example a five-row GPU monitor) use cell
+    // count rather than proportion. Keep those paths out of the ordinary
+    // three-way ratio merge, whose values are only comparable when both
+    // windows have the same dimensions.
+    let fixed_strips = if let Some(remote_pane) = remote_panes.first() {
+        let remote_area = pane_area(&deps.remote, &remote_pane.pane_id).await;
+        let local_area = match map.get(&remote_pane.pane_id) {
+            Some(id) => pane_area(&deps.local, id).await,
+            None => None,
+        };
+        match (remote_area, local_area) {
+            (Some(remote_area), Some(local_area)) => crate::layout_sync::plan_remote_fixed_strips(
+                &remote.layout.root,
+                &local.layout.root,
+                remote_area,
+                local_area,
+            ),
+            _ => crate::layout_sync::FixedStripPlan::default(),
+        }
+    } else {
+        crate::layout_sync::FixedStripPlan::default()
+    };
+
     // swaps first: a ratio describes a position, so it only means the right
     // thing once the right pane is sitting in it
     for (source, target) in &plan.swaps {
@@ -525,7 +555,12 @@ async fn reconcile_tab_geometry(
     }
 
     let mut failed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for fix in &plan.ratios {
+    for fix in plan
+        .ratios
+        .iter()
+        .filter(|fix| !fixed_strips.paths.contains(&crate::layout_sync::path_key(&fix.path)))
+        .chain(fixed_strips.ratios.iter())
+    {
         let (api, tab) = match fix.apply_to {
             crate::layout_sync::Side::Local => (&deps.local, local_tab),
             crate::layout_sync::Side::Remote => (&deps.remote, remote_tab),
@@ -540,10 +575,13 @@ async fn reconcile_tab_geometry(
     // write would make the next pass read the difference as an edit on the
     // other side and push it the wrong way.
     for (path, ratio) in plan.base {
-        if failed.contains(&path) {
+        if failed.contains(&path) || fixed_strips.paths.contains(&path) {
             continue;
         }
         state.ratios.insert(format!("{prefix}{path}"), ratio);
+    }
+    for path in fixed_strips.paths {
+        state.ratios.remove(&format!("{prefix}{path}"));
     }
 }
 

@@ -256,6 +256,140 @@ pub fn plan_sync(
     plan
 }
 
+/// Maximum side length, in terminal cells, treated as a fixed-size strip.
+///
+/// This is the remote `herdr-gpu-pane` case: a five-row monitor should remain
+/// five rows in a taller local window instead of preserving its percentage.
+const STRIP_MAX_CELLS: f64 = 8.0;
+
+/// Remote-authoritative corrections for fixed-size strips.
+///
+/// `remote_area` and `local_area` are `(width, height)` in terminal cells.
+/// `paths` marks split ratios that must be excluded from the ordinary
+/// proportional three-way merge; `ratios` contains the corresponding local
+/// ratios that reproduce the remote strip's cell count.
+#[derive(Debug, Default, PartialEq)]
+pub struct FixedStripPlan {
+    pub paths: BTreeSet<String>,
+    pub ratios: Vec<RatioFix>,
+}
+
+pub fn plan_remote_fixed_strips(
+    remote: &LayoutNode,
+    local: &LayoutNode,
+    remote_area: (f64, f64),
+    local_area: (f64, f64),
+) -> FixedStripPlan {
+    let mut plan = FixedStripPlan::default();
+    walk_fixed_strips(
+        remote,
+        local,
+        remote_area,
+        local_area,
+        &mut Vec::new(),
+        &mut plan,
+    );
+    plan
+}
+
+fn axis(area: (f64, f64), direction: &str) -> f64 {
+    if direction == "down" { area.1 } else { area.0 }
+}
+
+fn sub_areas(
+    area: (f64, f64),
+    direction: &str,
+    ratio: f64,
+) -> ((f64, f64), (f64, f64)) {
+    if direction == "down" {
+        ((area.0, area.1 * ratio), (area.0, area.1 * (1.0 - ratio)))
+    } else {
+        ((area.0 * ratio, area.1), (area.0 * (1.0 - ratio), area.1))
+    }
+}
+
+fn walk_fixed_strips(
+    remote: &LayoutNode,
+    local: &LayoutNode,
+    remote_area: (f64, f64),
+    local_area: (f64, f64),
+    path: &mut Vec<bool>,
+    plan: &mut FixedStripPlan,
+) {
+    let (
+        LayoutNode::Split {
+            direction: remote_direction,
+            ratio: remote_ratio,
+            first: remote_first,
+            second: remote_second,
+        },
+        LayoutNode::Split {
+            direction: local_direction,
+            ratio: local_ratio,
+            first: local_first,
+            second: local_second,
+        },
+    ) = (remote, local)
+    else {
+        return;
+    };
+    if remote_direction != local_direction {
+        return;
+    }
+
+    let remote_axis = axis(remote_area, remote_direction);
+    let local_axis = axis(local_area, local_direction);
+    if remote_axis <= 0.0 || local_axis <= 0.0 {
+        return;
+    }
+    let remote_first_cells = remote_axis * remote_ratio;
+    let remote_second_cells = remote_axis - remote_first_cells;
+    let first_is_strip = remote_first_cells <= STRIP_MAX_CELLS;
+    let second_is_strip = remote_second_cells <= STRIP_MAX_CELLS;
+    // If both sides are tiny, the parent itself is constrained; choosing one
+    // side as the invariant would be arbitrary.
+    let desired_local_ratio = match (first_is_strip, second_is_strip) {
+        (true, false) => (remote_first_cells / local_axis).clamp(0.02, 0.9),
+        (false, true) => (1.0 - remote_second_cells / local_axis).clamp(0.1, 0.98),
+        _ => *local_ratio,
+    };
+    if first_is_strip ^ second_is_strip {
+        plan.paths.insert(path_key(path));
+        if !ratios_equal(desired_local_ratio, *local_ratio) {
+            plan.ratios.push(RatioFix {
+                path: path.clone(),
+                ratio: desired_local_ratio,
+                apply_to: Side::Local,
+            });
+        }
+    }
+
+    let (remote_first_area, remote_second_area) =
+        sub_areas(remote_area, remote_direction, *remote_ratio);
+    let (local_first_area, local_second_area) =
+        sub_areas(local_area, local_direction, desired_local_ratio);
+    path.push(false);
+    walk_fixed_strips(
+        remote_first,
+        local_first,
+        remote_first_area,
+        local_first_area,
+        path,
+        plan,
+    );
+    path.pop();
+    path.push(true);
+    walk_fixed_strips(
+        remote_second,
+        local_second,
+        remote_second_area,
+        local_second_area,
+        path,
+        plan,
+    );
+    path.pop();
+}
+
 #[allow(clippy::too_many_arguments)] // one walk, all of it needed per level
 fn walk(
     remote: &LayoutNode,
@@ -598,6 +732,45 @@ mod tests {
         let local = split("right", 0.45, leaf("l1"), leaf("l2"));
         let plan =
             plan_sync(&remote, &local, &map(&[("p1", "l1"), ("p2", "l2")]), &BTreeMap::new(), false);
+        assert!(plan.ratios.is_empty());
+    }
+
+    #[test]
+    fn remote_monitor_strip_keeps_its_cell_height_locally() {
+        let remote = split(
+            "right",
+            0.7,
+            leaf("p1"),
+            split("down", 5.0 / 23.0, leaf("p2"), leaf("p3")),
+        );
+        let local = split(
+            "right",
+            0.7,
+            leaf("l1"),
+            split("down", 5.0 / 23.0, leaf("l2"), leaf("l3")),
+        );
+
+        let plan = plan_remote_fixed_strips(&remote, &local, (166.0, 23.0), (184.0, 50.0));
+
+        assert_eq!(plan.paths, BTreeSet::from(["T".to_string()]));
+        assert_eq!(
+            plan.ratios,
+            vec![RatioFix {
+                path: vec![true],
+                ratio: 0.1,
+                apply_to: Side::Local,
+            }]
+        );
+    }
+
+    #[test]
+    fn proportional_division_is_not_classified_as_a_strip() {
+        let remote = split("down", 0.5, leaf("p1"), leaf("p2"));
+        let local = split("down", 0.8, leaf("l1"), leaf("l2"));
+
+        let plan = plan_remote_fixed_strips(&remote, &local, (166.0, 50.0), (184.0, 60.0));
+
+        assert!(plan.paths.is_empty());
         assert!(plan.ratios.is_empty());
     }
 

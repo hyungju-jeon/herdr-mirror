@@ -490,8 +490,9 @@ async fn heal_zombie_mirrors(
     }
 }
 
-// Local events: mirror closes drive tombstoning — poke every host so the
+/// Local events: mirror closes drive tombstoning — poke every host so the
 /// next converge records the user's intent promptly.
+#[allow(clippy::too_many_arguments)] // boundary task with explicit event dependencies
 async fn local_events_task(
     local: ApiClient,
     pokers: Vec<mpsc::Sender<()>>,
