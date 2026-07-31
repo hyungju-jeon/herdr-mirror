@@ -36,6 +36,12 @@ description = "One-shot mirror pass without starting the daemon"
 command = ["./target/release/herdr-mirror", "once"]
 
 [[actions]]
+id = "recover"
+title = "Mirror: recover connection"
+description = "Reset shared remote transports, sync immediately, and ensure the daemon is running"
+command = ["./target/release/herdr-mirror", "recover"]
+
+[[actions]]
 id = "remote-new-workspace"
 title = "Mirror: new workspace"
 description = "New workspace on the remote host (the invoking mirror's host, else hosts.toml default_host)"
@@ -64,6 +70,18 @@ id = "restore"
 title = "Mirror: restore closed mirrors"
 description = "Bring back mirror workspaces/panes you closed locally"
 command = ["./target/release/herdr-mirror", "restore"]
+
+[[actions]]
+id = "session-title-summarize"
+title = "Mirror: summarize local and remote session titles"
+description = "Run protected semantic title summarization next to each host's own transcripts"
+command = ["./target/release/herdr-mirror", "plugin-action-all", "herdr-session-title", "summarize"]
+
+[[actions]]
+id = "session-title-force-summarize"
+title = "Mirror: force-summarize local and remote session titles"
+description = "Force semantic title summarization next to each host's own transcripts"
+command = ["./target/release/herdr-mirror", "plugin-action-all", "herdr-session-title", "force-summarize"]
 
 [[actions]]
 id = "teardown"

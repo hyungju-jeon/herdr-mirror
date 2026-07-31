@@ -3,8 +3,9 @@
 //
 //   herdr-mirror daemon                 # control plane (foreground; `start` spawns this)
 //   herdr-mirror pane <host> <target>   # data plane: one per mirror pane
-//   herdr-mirror start|pause|ensure|status|once|restore|teardown
+//   herdr-mirror start|pause|ensure|status|once|recover|restore|teardown
 //   herdr-mirror remote-workspace|remote-tab|remote-split <right|down>
+//   herdr-mirror plugin-action-all <plugin-id> <action-id>
 
 mod api;
 mod closes;
@@ -69,6 +70,7 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
         }
         "status" => daemon::cmd_status(&Env::resolve()?),
         "once" => rt.block_on(daemon::cmd_once(Env::resolve()?)),
+        "recover" => rt.block_on(daemon::cmd_recover(Env::resolve()?)),
         "restore" => daemon::cmd_restore(
             &Env::resolve()?,
             rest.get(1).map(String::as_str),
@@ -86,8 +88,18 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             "split",
             rest.get(1).map(String::as_str),
         )),
+        "plugin-action-all" => {
+            let usage = "usage: herdr-mirror plugin-action-all <plugin-id> <action-id>";
+            let plugin_id = rest.get(1).ok_or_else(|| util::err(usage))?;
+            let action_id = rest.get(2).ok_or_else(|| util::err(usage))?;
+            rt.block_on(remote_action::invoke_plugin_action_everywhere(
+                Env::resolve()?,
+                plugin_id,
+                action_id,
+            ))
+        }
         other => Err(util::err(format!(
-            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|remote-workspace|remote-tab|remote-split)"
+            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|recover|restore|teardown|remote-workspace|remote-tab|remote-split|plugin-action-all)"
         ))),
     }
 }

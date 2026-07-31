@@ -811,6 +811,27 @@ pub async fn cmd_once(env: Env) -> Result<()> {
     Ok(())
 }
 
+/// Reset the shared host transports, reconcile immediately, and ensure the
+/// background daemon is running. Mirror panes and their direct streams stay
+/// alive throughout; only daemon/API connections are replaced.
+pub async fn cmd_recover(env: Env) -> Result<()> {
+    let config = load_config(&env.config_search)?;
+    for host in &config.hosts {
+        let mut remote = crate::remote::RemoteHost::new(host, &env.state_dir);
+        let reset = remote.reset_api_transport().await?;
+        println!(
+            "host {}: {}",
+            host.name,
+            if reset { "transport reset" } else { "no active transport to reset" }
+        );
+    }
+    set_paused(&env, false);
+    cmd_start(&env)?;
+    cmd_once(env).await?;
+    println!("mirror recovery complete");
+    Ok(())
+}
+
 /// Un-tombstone mirrors the user closed: deleting the entries makes converge
 /// recreate them through the normal paths. Pokes the daemon; never converges.
 pub fn cmd_restore(env: &Env, filter_host: Option<&str>, filter_id: Option<&str>) -> Result<()> {

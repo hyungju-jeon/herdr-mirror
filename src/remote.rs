@@ -3,6 +3,7 @@
 // their own direct connections instead (see pane.rs).
 
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -62,6 +63,42 @@ async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
         },
         Ok(Err(e)) => SshOutput { code: 1, out: String::new(), err: e.to_string() },
         Err(_) => SshOutput { code: 1, out: String::new(), err: "ssh timeout".into() },
+    }
+}
+
+/// Serialize ControlMaster creation across the daemon and one-shot commands.
+///
+/// Without this lock, two processes can both observe a missing master and run
+/// `ssh -M -f -N`. OpenSSH keeps the winner's control socket but silently
+/// leaves the loser as a detached standalone connection. The file itself may
+/// persist; `flock` ownership is tied to the open descriptor and therefore
+/// recovers automatically if a process exits.
+async fn acquire_master_lock(ctl_path: &Path) -> Result<fs::File> {
+    let lock_path = PathBuf::from(format!("{}.lock", ctl_path.display()));
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(lock);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(err(format!(
+                "cannot lock ssh control master {}: {error}",
+                lock_path.display()
+            )));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(err(format!(
+                "timed out waiting for ssh control master lock {}",
+                lock_path.display()
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -196,6 +233,12 @@ impl RemoteHost {
         if ssh(&check, 15000).await.code == 0 {
             return Ok(());
         }
+        let _master_lock = acquire_master_lock(&self.ctl_path).await?;
+        // Another herdr-mirror process may have established the master while
+        // this process waited for the host-scoped lock.
+        if ssh(&check, 15000).await.code == 0 {
+            return Ok(());
+        }
         self.forwarded = false;
         // OpenSSH falls back to a standalone connection when ControlPath exists
         // but no master is listening. With -f -N that silently leaks one process
@@ -231,6 +274,38 @@ impl RemoteHost {
             )));
         }
         Ok(())
+    }
+
+    /// Drop only this host's shared API/control connection.
+    ///
+    /// Pane streams use independent SSH connections, so resetting the master
+    /// cannot close remote terminals or agents. The next `connect_api` call
+    /// recreates the master and its socket forward through the serialized
+    /// `ensure_master` path above.
+    pub async fn reset_api_transport(&mut self) -> Result<bool> {
+        if self.cfg.kind.is_docker() {
+            return Ok(false);
+        }
+        let mut exit = self.base_args();
+        exit.extend(["-O".into(), "exit".into(), self.cfg.target.clone()]);
+        let result = ssh(&exit, 15000).await;
+        self.forwarded = false;
+        if result.code == 0 {
+            return Ok(true);
+        }
+        // Recovery is idempotent: no socket means there is no master left to
+        // reset. Other failures matter because silently reusing a master that
+        // rejected the exit request would defeat the recovery action.
+        if result.err.contains("Control socket connect")
+            && result.err.contains("No such file or directory")
+        {
+            return Ok(false);
+        }
+        Err(err(format!(
+            "ssh master reset for {} failed: {}",
+            self.cfg.target,
+            nonempty(&result.err, result.code)
+        )))
     }
 
     pub async fn exec(&self, command: &str, timeout_ms: u64) -> Result<String> {
@@ -534,6 +609,45 @@ mod tests {
         assert!(error.contains("is not a socket"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "do not delete");
         fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn master_lock_serializes_competing_connectors() {
+        let ctl_path = test_path("master-lock");
+        let first = acquire_master_lock(&ctl_path).await.unwrap();
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(100),
+            acquire_master_lock(&ctl_path),
+        )
+        .await;
+        assert!(blocked.is_err(), "a second connector acquired the live master lock");
+
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(1), acquire_master_lock(&ctl_path))
+            .await
+            .expect("released master lock was not reacquired")
+            .unwrap();
+        drop(second);
+        fs::remove_file(format!("{}.lock", ctl_path.display())).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reset_is_idempotent_when_no_master_exists() {
+        // OpenSSH rejects ControlPath values >= 104 bytes on macOS, so this
+        // fixture deliberately stays shorter than std::env::temp_dir there.
+        let dir = PathBuf::from(format!("/tmp/hm-reset-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::config::parse_config("[hosts.test]\ntarget = \"unused\"\n")
+            .unwrap()
+            .hosts
+            .remove(0);
+        let mut host = RemoteHost::new(&cfg, &dir);
+
+        assert!(!host.reset_api_transport().await.unwrap());
+
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

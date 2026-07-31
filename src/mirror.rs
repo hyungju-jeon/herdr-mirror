@@ -52,6 +52,16 @@ pub struct PaneInfo {
     pub label: Option<String>,
     pub cwd: Option<String>,
     pub foreground_cwd: Option<String>,
+    /// Explicit session identity can outlive native process detection. This is
+    /// especially useful when a shell helper such as Iris owns the outer PTY.
+    pub agent_session: Option<AgentSessionInfo>,
+    #[serde(default)]
+    pub tokens: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentSessionInfo {
+    pub agent: String,
 }
 
 /// Agent fields as they appear both in snapshot `agents[]` and in
@@ -107,6 +117,36 @@ impl AgentInfo {
             .or(self.terminal_title_stripped.as_deref())
             .or(self.terminal_title.as_deref())
     }
+}
+
+/// Recover an idle agent hidden behind a shell wrapper.
+///
+/// The session identity establishes the canonical agent, while the usage token
+/// establishes that the agent's own end-of-turn hook has run in this pane.
+fn inferred_wrapped_agent(pane: &PaneInfo) -> Option<AgentInfo> {
+    let session = pane.agent_session.as_ref()?;
+    if session.agent.is_empty()
+        || !pane
+            .tokens
+            .get("usage")
+            .is_some_and(|value| !value.is_empty())
+    {
+        return None;
+    }
+    Some(AgentInfo {
+        pane_id: pane.pane_id.clone(),
+        agent: Some(session.agent.clone()),
+        // A wrapped pane has no native agent row to supply display metadata.
+        // Preserve the configured Codex symbol instead of exposing its
+        // canonical identity as user-facing text.
+        display_agent: Some(match session.agent.as_str() {
+            "codex" => "⬢".into(),
+            agent => agent.into(),
+        }),
+        agent_status: Some("idle".into()),
+        tokens: pane.tokens.clone(),
+        ..AgentInfo::default()
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1457,10 +1497,22 @@ pub async fn apply_remote_closes(
 }
 
 pub async fn push_statuses(deps: &ConvergeDeps, remote_snap: &Snapshot, state: &mut HostState) {
-    let agent_by_pane: HashMap<&str, &AgentInfo> =
-        remote_snap.agents.iter().map(|a| (a.pane_id.as_str(), a)).collect();
+    let agent_by_pane: HashMap<&str, &AgentInfo> = remote_snap
+        .agents
+        .iter()
+        .map(|a| (a.pane_id.as_str(), a))
+        .collect();
+    let inferred_by_pane: HashMap<String, AgentInfo> = remote_snap
+        .panes
+        .iter()
+        .filter(|pane| !agent_by_pane.contains_key(pane.pane_id.as_str()))
+        .filter_map(|pane| inferred_wrapped_agent(pane).map(|agent| (pane.pane_id.clone(), agent)))
+        .collect();
     for (remote_id, entry) in state.panes.iter_mut() {
-        let agent = agent_by_pane.get(remote_id.as_str()).copied();
+        let agent = agent_by_pane
+            .get(remote_id.as_str())
+            .copied()
+            .or_else(|| inferred_by_pane.get(remote_id));
         push_pane_status(&deps.local, &deps.host.name, remote_id, entry, agent, &deps.log).await;
     }
 }
@@ -2070,5 +2122,47 @@ mod tests {
         });
         let info: AgentInfo = serde_json::from_value(data).unwrap();
         assert!(!info.has_agent());
+    }
+
+    #[test]
+    fn wrapped_agent_is_inferred_from_session_and_end_of_turn_usage() {
+        let pane: PaneInfo = serde_json::from_value(json!({
+            "pane_id": "w1:p1",
+            "workspace_id": "w1",
+            "tab_id": "w1:t1",
+            "agent_session": {
+                "agent": "codex",
+                "kind": "id",
+                "source": "herdr:codex",
+                "value": "session-1"
+            },
+            "tokens": {"usage": "5.6-sol | wk 79%"}
+        }))
+        .unwrap();
+
+        let inferred = inferred_wrapped_agent(&pane).unwrap();
+
+        assert_eq!(inferred.agent.as_deref(), Some("codex"));
+        assert_eq!(inferred.display_agent.as_deref(), Some("⬢"));
+        assert_eq!(inferred.agent_status.as_deref(), Some("idle"));
+        assert_eq!(inferred.tokens.get("usage").map(String::as_str), Some("5.6-sol | wk 79%"));
+    }
+
+    #[test]
+    fn session_without_agent_reported_usage_is_not_inferred() {
+        let pane: PaneInfo = serde_json::from_value(json!({
+            "pane_id": "w1:p1",
+            "workspace_id": "w1",
+            "tab_id": "w1:t1",
+            "agent_session": {
+                "agent": "codex",
+                "kind": "id",
+                "source": "herdr:codex",
+                "value": "stale-session"
+            }
+        }))
+        .unwrap();
+
+        assert!(inferred_wrapped_agent(&pane).is_none());
     }
 }

@@ -469,6 +469,47 @@ fn incomplete_mouse_suffix(bytes: &[u8]) -> usize {
     bytes.len()
 }
 
+/// Restore the macOS line-editing actions that Kitty keyboard mode makes
+/// explicit. The remote PTY receives bytes, not key events, so shells and TUIs
+/// that do not decode Kitty's Alt/Super forms need their conventional
+/// Readline-compatible sequences.
+fn normalize_macos_edit_keys(bytes: &[u8]) -> Vec<u8> {
+    const KEYS: &[(&[u8], &[u8])] = &[
+        // Ghostty's Option+Left/Right actions become Alt+b/f in the local Herdr
+        // pane, which Kitty mode encodes as CSI-u.
+        (b"\x1b[98;3u", b"\x1bb"),
+        (b"\x1b[102;3u", b"\x1bf"),
+        // Direct Alt+Left/Right encodings (e.g. other host terminals).
+        (b"\x1b[1;3D", b"\x1bb"),
+        (b"\x1b[1;3C", b"\x1bf"),
+        // Option+Backspace: delete the preceding word.
+        (b"\x1b[127;3u", b"\x1b\x7f"),
+        // Ghostty maps Command+Backspace to Ctrl+U before Herdr re-encodes it.
+        (b"\x1b[117;5u", b"\x15"),
+        // Direct Super encodings are the fallback when the host terminal has no
+        // semantic macOS key binding.
+        (b"\x1b[127;9u", b"\x15"),
+        (b"\x1b[1;9D", b"\x01"),
+        (b"\x1b[1;9C", b"\x05"),
+    ];
+
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if let Some((encoded, legacy)) = KEYS
+            .iter()
+            .find(|(encoded, _)| bytes[at..].starts_with(encoded))
+        {
+            out.extend_from_slice(legacy);
+            at += encoded.len();
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    out
+}
+
 
 // ---------------------------------------------------------------------------
 // the wrapper state machine
@@ -1097,6 +1138,7 @@ impl App {
             self.send(s).await;
         }
         if !rest.is_empty() {
+            let rest = normalize_macos_edit_keys(&rest);
             let msg = json!({ "type": "terminal.input", "bytes": B64.encode(&rest) });
             self.send(msg).await;
             // optimistic local echo: draw the keystroke now, verify on frame
@@ -1115,7 +1157,13 @@ pub async fn run(args: Args) -> Result<()> {
     let raw = if tty {
         // 1002/1006: button-event mouse tracking with SGR encoding, so wheel and
         // clicks reach us instead of scrolling the hosting pane's scrollback
-        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h");
+        //
+        // CSI > 1 u: push Kitty's disambiguate-escape-codes keyboard mode on the
+        // local terminal. The remote TUI enables this in its own PTY, but Mirror
+        // transports rendered frames rather than that control sequence. Enabling
+        // it here preserves modified control keys such as Shift+Enter as
+        // CSI 13;2u instead of collapsing them to the same CR byte as Enter.
+        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h\x1b[>1u");
         RawMode::enable()
     } else {
         None
@@ -1286,7 +1334,9 @@ pub async fn run(args: Args) -> Result<()> {
     if tty {
         // ?1l with the rest: leaving the hosting pane in application cursor mode
         // would misencode arrows for whatever runs there next
-        write_stdout("\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?25h\x1b[?1049l");
+        // Pop the keyboard mode while still on the alternate screen where it
+        // was pushed; Kitty keyboard-mode stacks are screen-specific.
+        write_stdout("\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?25h\x1b[<u\x1b[?1049l");
     }
     if let Some(raw) = raw {
         raw.restore();
@@ -1352,6 +1402,7 @@ mod tests {
         assert_eq!(incomplete_mouse_suffix(b"\x1b"), 1); // lone Escape key
         assert_eq!(incomplete_mouse_suffix(b"\x1b["), 2); // CSI start
         assert_eq!(incomplete_mouse_suffix(b"\x1b[A"), 3); // up arrow, complete
+        assert_eq!(incomplete_mouse_suffix(b"\x1b[13;2u"), 7); // Shift+Enter
         assert_eq!(incomplete_mouse_suffix(b"plain"), 5); // no escape at all
         assert_eq!(incomplete_mouse_suffix(b""), 0);
     }
@@ -1363,6 +1414,25 @@ mod tests {
         assert!(!is_partial_mouse(b"\x1b[")); // no `<` yet — ambiguous CSI
         assert!(!is_partial_mouse(b"\x1b")); // just Escape
         assert!(!is_partial_mouse(b"\x1b[<0;5x")); // non-param byte breaks it
+    }
+
+    #[test]
+    fn restores_macos_edit_keys_from_kitty_encoding() {
+        assert_eq!(normalize_macos_edit_keys(b"\x1b[98;3u"), b"\x1bb");
+        assert_eq!(normalize_macos_edit_keys(b"\x1b[102;3u"), b"\x1bf");
+        assert_eq!(normalize_macos_edit_keys(b"\x1b[127;3u"), b"\x1b\x7f");
+        assert_eq!(normalize_macos_edit_keys(b"\x1b[117;5u"), b"\x15");
+        assert_eq!(normalize_macos_edit_keys(b"\x1b[127;9u"), b"\x15");
+        assert_eq!(normalize_macos_edit_keys(b"\x1b[1;9D"), b"\x01");
+        assert_eq!(normalize_macos_edit_keys(b"\x1b[1;9C"), b"\x05");
+    }
+
+    #[test]
+    fn leaves_unrelated_kitty_keys_unchanged() {
+        assert_eq!(
+            normalize_macos_edit_keys(b"a\x1b[13;2u\x1b[1;2D"),
+            b"a\x1b[13;2u\x1b[1;2D"
+        );
     }
 
 

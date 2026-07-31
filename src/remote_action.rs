@@ -28,6 +28,7 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::api::ApiClient;
 use crate::config::{load_config, HostConfig};
 use crate::mirror::fetch_snapshot;
 use crate::remote::RemoteHost;
@@ -44,6 +45,55 @@ struct Resolved {
     host: HostConfig,
     remote_ws_id: Option<String>,
     remote_pane_id: Option<String>,
+}
+
+/// Invoke one plugin action on the local Herdr and every configured remote.
+///
+/// The action runs next to each host's own state and transcripts. This matters
+/// for actions such as semantic tab naming: a local mirror pane cannot safely
+/// resolve a remote agent session from local files.
+pub async fn invoke_plugin_action_everywhere(
+    env: Env,
+    plugin_id: &str,
+    action_id: &str,
+) -> Result<()> {
+    let params = json!({ "plugin_id": plugin_id, "action_id": action_id });
+    let mut failures = Vec::new();
+
+    match ApiClient::connect(&env.local_socket).await {
+        Ok(local) => {
+            if let Err(error) = local.request("plugin.action.invoke", params.clone()).await {
+                failures.push(format!("local: {error}"));
+            }
+        }
+        Err(error) => failures.push(format!("local: {error}")),
+    }
+
+    let config = load_config(&env.config_search)?;
+    for host in &config.hosts {
+        let mut remote = RemoteHost::new(host, &env.state_dir);
+        match remote.connect_api().await {
+            Ok((api, _status)) => {
+                if let Err(error) = api.request("plugin.action.invoke", params.clone()).await {
+                    failures.push(format!("{}: {error}", host.name));
+                }
+            }
+            Err(error) => failures.push(format!("{}: {error}", host.name)),
+        }
+    }
+
+    if failures.is_empty() {
+        println!(
+            "invoked {plugin_id}.{action_id} locally and on {} remote host(s)",
+            config.hosts.len()
+        );
+        Ok(())
+    } else {
+        Err(err(format!(
+            "{plugin_id}.{action_id} was not invoked everywhere:\n  {}",
+            failures.join("\n  ")
+        )))
+    }
 }
 
 /// find which host (if any) mirrors the workspace the action was invoked from
