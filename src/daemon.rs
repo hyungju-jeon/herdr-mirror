@@ -412,8 +412,91 @@ async fn has_live_streamer(local: &ApiClient, pane_id: &str) -> Option<bool> {
         return Some(true); // our wrapper is the foreground — definitely live
     }
     let leaf = procs.last()?.get("name")?.as_str()?;
+    if leaf == "iris" {
+        // Iris owns the pane's foreground process group even after it starts
+        // our wrapper. Ask the OS for descendants of this exact pane's shell:
+        // an Iris-only chain is an idle prompt we can heal, while a streamer
+        // (or any other child) still owns stdin and must be left alone.
+        let shell_pid = v.pointer("/process_info/shell_pid")?.as_u64()? as u32;
+        return iris_child_owns_pane(shell_pid).await;
+    }
     // shell prompt → Some(false) (re-exec ok); anything else → Some(true) (leave)
     Some(!crate::foreground::is_shell(leaf))
+}
+
+/// Does an Iris-wrapped pane have a descendant that still owns its input?
+///
+/// `pane.process_info` deliberately reports Iris as the foreground process for
+/// both an idle prompt and a live child, so its process list alone cannot tell
+/// whether the mirror streamer survived session restore. `ps` is local-only and
+/// the walk starts at this pane's `shell_pid`, preserving that pane boundary.
+async fn iris_child_owns_pane(shell_pid: u32) -> Option<bool> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::process::Command::new("ps")
+            .args(["-eo", "pid=,ppid=,args="])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    iris_process_tree_owns_pane(&stdout, shell_pid)
+}
+
+/// Classify descendants from `ps -eo pid=,ppid=,args=`.
+///
+/// `Some(false)` is deliberately narrow: only an Iris-only process chain is
+/// considered an idle shell. An unrecognised child returns `Some(true)` so a
+/// recovery never types an `exec` command into another live program.
+fn iris_process_tree_owns_pane(ps_output: &str, shell_pid: u32) -> Option<bool> {
+    #[derive(Debug)]
+    struct Process {
+        pid: u32,
+        ppid: u32,
+        args: String,
+    }
+
+    let processes: Vec<Process> = ps_output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some(Process {
+                pid: fields.next()?.parse().ok()?,
+                ppid: fields.next()?.parse().ok()?,
+                args: fields.collect::<Vec<_>>().join(" "),
+            })
+        })
+        .collect();
+    processes.iter().any(|p| p.pid == shell_pid).then_some(())?;
+
+    let mut pending = vec![shell_pid];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(parent) = pending.pop() {
+        if !visited.insert(parent) {
+            continue;
+        }
+        for process in processes.iter().filter(|p| p.ppid == parent) {
+            let mut argv = process.args.split_whitespace();
+            let is_streamer = argv
+                .next()
+                .is_some_and(|exe| exe.ends_with("herdr-mirror"))
+                && argv.next() == Some("pane");
+            if is_streamer || !is_iris_command(&process.args) {
+                return Some(true);
+            }
+            pending.push(process.pid);
+        }
+    }
+    Some(false)
+}
+
+fn is_iris_command(args: &str) -> bool {
+    args.split_whitespace()
+        .next()
+        .and_then(|exe| std::path::Path::new(exe).file_name())
+        .and_then(|name| name.to_str())
+        == Some("iris")
 }
 
 /// Is this foreground process one of our pane wrappers?
@@ -977,5 +1060,29 @@ mod tests {
     fn other_subcommands_are_not_streamers() {
         assert!(!is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror", "status"])));
         assert!(!is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror"])));
+    }
+
+    #[test]
+    fn iris_process_tree_distinguishes_a_streamer_from_an_idle_prompt() {
+        let idle = r#"
+            2524 2520 iris
+            2712 2524 /usr/local/bin/iris
+        "#;
+        assert_eq!(iris_process_tree_owns_pane(idle, 2524), Some(false));
+
+        let streaming = r#"
+            4223 2520 iris
+            4262 4223 /usr/local/bin/iris
+            4266 4262 /plugins/herdr-mirror/target/release/herdr-mirror pane bigcat wN:p2R
+            4554 4266 ssh bigcat terminal-session
+        "#;
+        assert_eq!(iris_process_tree_owns_pane(streaming, 4223), Some(true));
+
+        let unknown_child = r#"
+            5000 1 iris
+            5001 5000 /usr/local/bin/iris
+            5002 5001 codex
+        "#;
+        assert_eq!(iris_process_tree_owns_pane(unknown_child, 5000), Some(true));
     }
 }
