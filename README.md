@@ -106,11 +106,12 @@ blank and a busy pane can't contend with or drop another's stream. Sidebar
 agent status is daemon-driven, not stream-derived, so every agent's state stays
 live regardless of what any stream is doing.
 
-**Connection recovery** — `herdr-mirror recover` resets only the shared
-daemon/API SSH connection, runs an immediate safe reconciliation, and ensures
-the daemon is running. Independent pane streams, remote terminals, and agents
-remain alive. Use this when mirror rows stop updating or keep a stale agent
-state after the remote itself is still reachable.
+**Connection and stream recovery** — `herdr-mirror recover` resets only the
+shared daemon/API SSH connection, restarts mapped local panes that were left at
+an idle Iris or shell prompt, runs an immediate safe reconciliation, and
+ensures the daemon is running. Live pane streams, remote terminals, and agents
+remain alive. Use this when mirror rows stop updating, keep a stale agent state,
+or show a local `.mirror-pane` prompt after the remote remains reachable.
 
 ### Keybinds
 
@@ -124,7 +125,7 @@ type = "plugin_action"
 command = "mirror.start"       # start / resume the daemon
 
 [[keys.command]]
-key = "prefix+shift+u"         # reset transport + refresh mirror state
+key = "prefix+shift+u"         # reset transport + restore missing streams
 type = "plugin_action"
 command = "mirror.recover"
 

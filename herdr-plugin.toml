@@ -38,7 +38,7 @@ command = ["./target/release/herdr-mirror", "once"]
 [[actions]]
 id = "recover"
 title = "Mirror: recover connection"
-description = "Reset shared remote transports, sync immediately, and ensure the daemon is running"
+description = "Reset transports, restore stopped mirror streams, sync immediately, and ensure the daemon is running"
 command = ["./target/release/herdr-mirror", "recover"]
 
 [[actions]]
