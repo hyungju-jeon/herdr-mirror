@@ -446,9 +446,10 @@ async fn iris_child_owns_pane(shell_pid: u32) -> Option<bool> {
 
 /// Classify descendants from `ps -eo pid=,ppid=,args=`.
 ///
-/// `Some(false)` is deliberately narrow: only an Iris-only process chain is
-/// considered an idle shell. An unrecognised child returns `Some(true)` so a
-/// recovery never types an `exec` command into another live program.
+/// `Some(false)` is deliberately narrow: only Iris and interactive-shell
+/// descendants are considered an idle prompt. An unrecognised child returns
+/// `Some(true)` so a recovery never types an `exec` command into another live
+/// program.
 fn iris_process_tree_owns_pane(ps_output: &str, shell_pid: u32) -> Option<bool> {
     #[derive(Debug)]
     struct Process {
@@ -482,7 +483,7 @@ fn iris_process_tree_owns_pane(ps_output: &str, shell_pid: u32) -> Option<bool> 
                 .next()
                 .is_some_and(|exe| exe.ends_with("herdr-mirror"))
                 && argv.next() == Some("pane");
-            if is_streamer || !is_iris_command(&process.args) {
+            if is_streamer || !is_iris_or_shell_command(&process.args) {
                 return Some(true);
             }
             pending.push(process.pid);
@@ -491,12 +492,15 @@ fn iris_process_tree_owns_pane(ps_output: &str, shell_pid: u32) -> Option<bool> 
     Some(false)
 }
 
-fn is_iris_command(args: &str) -> bool {
-    args.split_whitespace()
+fn is_iris_or_shell_command(args: &str) -> bool {
+    let Some(exe) = args.split_whitespace()
         .next()
         .and_then(|exe| std::path::Path::new(exe).file_name())
         .and_then(|name| name.to_str())
-        == Some("iris")
+    else {
+        return false;
+    };
+    exe == "iris" || crate::foreground::is_shell(exe)
 }
 
 /// Is this foreground process one of our pane wrappers?
@@ -542,7 +546,8 @@ async fn heal_zombie_mirrors(
         // line into the user's live remote session instead.
         let mut dead: Vec<(String, String)> = Vec::new();
         for (remote_pane_id, local_pane_id) in panes {
-            if has_live_streamer(local, &local_pane_id).await == Some(false) {
+            let live = has_live_streamer(local, &local_pane_id).await;
+            if live == Some(false) {
                 dead.push((remote_pane_id, local_pane_id));
             }
         }
@@ -1071,6 +1076,7 @@ mod tests {
         let idle = r#"
             2524 2520 iris
             2712 2524 /usr/local/bin/iris
+            2743 2712 zsh
         "#;
         assert_eq!(iris_process_tree_owns_pane(idle, 2524), Some(false));
 
