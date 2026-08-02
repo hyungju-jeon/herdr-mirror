@@ -520,10 +520,9 @@ async fn heal_zombie_mirrors(
     local: &ApiClient,
     state_dir: &std::path::Path,
     hosts: &[HostConfig],
-    pokers: &[mpsc::Sender<()>],
     log: &Logger,
 ) {
-    for (i, h) in hosts.iter().enumerate() {
+    for h in hosts {
         let state = load_state(state_dir, &h.name);
         let panes: Vec<(String, String)> = state
             .panes
@@ -569,7 +568,6 @@ async fn heal_zombie_mirrors(
             let argv = cmd_for(&remote_pane_id);
             crate::mirror::spawn_streamer_pane(local, &local_pane_id, &argv, log).await;
         }
-        let _ = pokers[i].try_send(());
     }
 }
 
@@ -609,7 +607,7 @@ async fn local_events_task(
                 // subscribe succeeding after a drop = the server is back up;
                 // give session-restore a beat, then sweep for zombie mirrors
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                heal_zombie_mirrors(&local, &state_dir, &hosts, &pokers, &log).await;
+                heal_zombie_mirrors(&local, &state_dir, &hosts, &log).await;
                 while let Some(e) = stream.next().await {
                     // Focusing a mirror is the user "attaching" to that remote.
                     // The remote itself never gets a focus event, so anything
@@ -704,6 +702,10 @@ pub async fn cmd_run(env: Env) -> Result<()> {
         };
         tasks.push(tokio::spawn(host_task(ctx, rx, frx)));
     }
+    // A daemon restart does not restart pane children. Heal the persisted
+    // mirror panes before waiting on the local event stream, whose first
+    // subscription can be delayed by a concurrently restoring Herdr server.
+    heal_zombie_mirrors(&local, &env.state_dir, &config.hosts, &log).await;
     let prefixes: Vec<String> = config.hosts.iter().map(|h| h.prefix.clone()).collect();
     tasks.push(tokio::spawn(local_events_task(
         local.clone(),
@@ -895,8 +897,8 @@ pub async fn cmd_once(env: Env) -> Result<()> {
 }
 
 /// Reset the shared host transports, reconcile immediately, and ensure the
-/// background daemon is running. Mirror panes and their direct streams stay
-/// alive throughout; only daemon/API connections are replaced.
+/// background daemon is running. It also restores any mapped local pane whose
+/// Iris wrapper is at an idle prompt rather than running its direct stream.
 pub async fn cmd_recover(env: Env) -> Result<()> {
     let config = load_config(&env.config_search)?;
     for host in &config.hosts {
@@ -910,6 +912,8 @@ pub async fn cmd_recover(env: Env) -> Result<()> {
     }
     set_paused(&env, false);
     cmd_start(&env)?;
+    let local = ApiClient::connect(&env.local_socket).await?;
+    heal_zombie_mirrors(&local, &env.state_dir, &config.hosts, &Logger::new(&env.state_dir, true)).await;
     cmd_once(env).await?;
     println!("mirror recovery complete");
     Ok(())
