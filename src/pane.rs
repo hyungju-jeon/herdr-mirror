@@ -587,6 +587,21 @@ fn has_mouse_seq(bytes: &[u8]) -> bool {
     bytes.windows(3).any(|w| w == [0x1b, b'[', b'<'])
 }
 
+/// Accept Ctrl+V from legacy input and from Kitty keyboard disambiguation.
+fn is_clipboard_image_request(bytes: &[u8]) -> bool {
+    matches!(bytes, b"\x16" | b"\x1b[118;5u")
+}
+
+/// Detect a file drop from Herdr versions that send its path without paste
+/// markers. The full input chunk must be valid UTF-8 and contain only existing
+/// absolute files, which is the same strict check as a framed drop.
+fn is_unframed_drop(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(crate::paste::dropped_paths)
+        .is_some()
+}
+
 /// Longest mouse packet accepted before a partial packet is released as input.
 const MAX_MOUSE_LEN: usize = 32;
 
@@ -1171,6 +1186,13 @@ impl App {
     /// first would silently swallow the second, and leave its markers in the
     /// tail to be forwarded raw at the remote.
     async fn handle_stdin(&mut self, chunk: Vec<u8>) {
+        // Some Herdr releases deliver a GUI file drop as one plain path chunk,
+        // even though this pane requested bracketed paste mode. Keep the normal
+        // framed path first-class, but accept that exact drop shape as well.
+        if self.paste_buf.is_empty() && is_unframed_drop(&chunk) {
+            self.route_paste_body(chunk).await;
+            return;
+        }
         let mut chunk = chunk;
         loop {
             match split_paste(&mut self.paste_buf, chunk) {
@@ -1276,7 +1298,7 @@ impl App {
     }
 
     async fn handle_stdin_inner(&mut self, buf: Vec<u8>) {
-        if buf.len() == 1 && buf[0] == 0x16 && !self.paste_inflight {
+        if is_clipboard_image_request(&buf) && !self.paste_inflight {
             self.paste_inflight = true;
             let tx = self.tx.clone();
             let ssh = self.args.ssh_target.clone();
@@ -2102,6 +2124,31 @@ mod tests {
             PasteSplit::Complete { before: vec![], body, after: vec![] },
             "re-framing must be exactly what the splitter undoes"
         );
+    }
+
+    #[test]
+    fn clipboard_image_request_accepts_legacy_and_kitty_ctrl_v() {
+        assert!(is_clipboard_image_request(b"\x16"));
+        assert!(is_clipboard_image_request(b"\x1b[118;5u"));
+        assert!(!is_clipboard_image_request(b"v"));
+        assert!(!is_clipboard_image_request(b"\x1b[118;3u"));
+    }
+
+    #[test]
+    fn unframed_drop_requires_a_complete_existing_absolute_path() {
+        let path = std::env::temp_dir().join(format!(
+            "mirror-unframed-drop-{}-{}.txt",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, b"drop").unwrap();
+
+        assert!(is_unframed_drop(path.to_string_lossy().as_bytes()));
+        assert!(!is_unframed_drop(b"relative.txt"));
+        assert!(!is_unframed_drop(b"/tmp/does-not-exist-herdr-mirror"));
+        assert!(!is_unframed_drop(b"\xff"));
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

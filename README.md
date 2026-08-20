@@ -258,6 +258,10 @@ an image off the clipboard needs `wl-paste` or `xclip` on Linux (macOS and
 dropped files need nothing). Uploads aren't cleaned up; `rm -rf
 ~/.cache/herdr-mirror/pastes` is always safe.
 
+The streamer accepts Ctrl+V in legacy and Kitty keyboard forms. It also accepts
+the single unframed path chunk sent by Herdr versions that omit bracketed-paste
+markers for a file drop. The path must identify an existing local regular file.
+
 ### Mouse
 
 Mirror panes adapt to what's running on the remote pane:
