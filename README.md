@@ -285,6 +285,12 @@ shell and a TUI there's a brief lag before the mouse mode catches up.
                          # (e.g. prefix+x) also closes it on the remote. Set
                          # false to only stop mirroring on a local close,
                          # leaving the remote pane and its agent running.
+# remote_focus_actions = []
+                         # remote plugin actions to run after a mirror workspace
+                         # receives local focus, for example
+                         # ["gpu-pane.ensure"]. The latest focus is passed with
+                         # its mapped remote workspace context after a short
+                         # debounce. Also settable per host.
 # always_control = true  # default. Mirror panes stay in control: writable, no
                          # idle release, and sized to your local pane so the
                          # remote fills it (ideal for headless remotes). Set

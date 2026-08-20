@@ -44,6 +44,7 @@ use std::io::IsTerminal;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::api::ApiClient;
 use crate::config::{load_config, HostConfig};
 use crate::mirror::fetch_snapshot;
 use crate::remote::RemoteHost;
@@ -60,6 +61,22 @@ struct Resolved {
     host: HostConfig,
     remote_ws_id: Option<String>,
     remote_pane_id: Option<String>,
+}
+
+fn plugin_action_params(spec: &str, context: Value) -> Result<Value> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err(err("plugin action ID is empty"));
+    }
+    // Pass the complete ID. Plugin IDs can contain dots, so splitting at the
+    // first dot can invoke a different action from the configured one.
+    Ok(json!({ "action_id": spec, "context": context }))
+}
+
+/// Invoke a plugin action through an already connected remote API.
+pub(crate) async fn invoke_connected(api: &ApiClient, spec: &str, context: Value) -> Result<()> {
+    api.request("plugin.action.invoke", plugin_action_params(spec, context)?).await?;
+    Ok(())
 }
 
 /// find which host (if any) mirrors the workspace the action was invoked from
@@ -271,8 +288,7 @@ async fn invoke(env: &Env, spec: &str) -> Result<()> {
             }
         }
     }
-    let params = json!({ "action_id": spec, "context": context });
-    api.request("plugin.action.invoke", params).await.map_err(|e| {
+    invoke_connected(&api, spec, context).await.map_err(|e| {
         err(format!(
             "remote invoke {spec} on {}: {e} (needs the plugin installed there, and a herdr with plugin.action.invoke)",
             resolved.host.name
@@ -378,4 +394,21 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
         _ => return Err(err(format!("unknown remote action: {kind}"))),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_action_id_is_not_split_at_dots() {
+        let params = plugin_action_params(
+            "company.tools.repair",
+            json!({ "workspace_id": "w7" }),
+        )
+        .unwrap();
+        assert_eq!(params["action_id"], "company.tools.repair");
+        assert_eq!(params["context"]["workspace_id"], "w7");
+        assert!(plugin_action_params("  ", json!({})).is_err());
+    }
 }

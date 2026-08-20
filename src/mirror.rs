@@ -1624,6 +1624,7 @@ mod tests {
             always_control: true,
             max_cols: None,
             max_rows: None,
+            remote_focus_actions: Vec::new(),
             api_transport: crate::config::ApiTransport::Auto,
         }
     }

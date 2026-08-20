@@ -612,6 +612,7 @@ mod tests {
             session: None,
             max_cols: None,
             max_rows: None,
+            remote_focus_actions: Vec::new(),
             api_transport: ApiTransport::Auto,
             always_control: true,
         }

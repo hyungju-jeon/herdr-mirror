@@ -115,6 +115,9 @@ pub struct HostConfig {
     /// of the local pane blank instead. Observe is unaffected either way.
     pub max_cols: Option<usize>,
     pub max_rows: Option<usize>,
+    /// Plugin action IDs invoked on this host when one of its mirror
+    /// workspaces receives local focus.
+    pub remote_focus_actions: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +163,7 @@ struct RawConfig {
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
+    remote_focus_actions: Option<Vec<String>>,
     // toml::Table (preserve_order) keeps declaration order — the first host
     // is the remote-create fallback, so order is user-visible
     #[serde(default)]
@@ -182,6 +186,7 @@ struct RawHost {
     max_cols: Option<usize>,
     max_rows: Option<usize>,
     api_transport: Option<String>,
+    remote_focus_actions: Option<Vec<String>>,
 }
 
 /// Resolve `kind` + its ref fields, rejecting combinations that would silently
@@ -261,6 +266,7 @@ pub fn load_config(candidates: &[PathBuf]) -> Result<MirrorConfig> {
 pub fn parse_config(text: &str) -> Result<MirrorConfig> {
     let raw: RawConfig = toml::from_str(text)?;
     let global_always_control = raw.always_control.unwrap_or(true);
+    let global_remote_focus_actions = raw.remote_focus_actions.unwrap_or_default();
     // 0 is treated as unset rather than "clamp to nothing", same as an empty
     // remote_bin: a cap that would starve the remote of every column is a typo,
     // not an instruction. Warn rather than dropping it silently — and say that
@@ -320,6 +326,9 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             always_control: h.always_control.unwrap_or(global_always_control),
             max_cols: size_cap(h.max_cols).or(global_max_cols),
             max_rows: size_cap(h.max_rows).or(global_max_rows),
+            remote_focus_actions: h
+                .remote_focus_actions
+                .unwrap_or_else(|| global_remote_focus_actions.clone()),
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
             api_transport,
             kind,
@@ -388,6 +397,20 @@ mod tests {
         let b = c.hosts.iter().find(|h| h.name == "b").unwrap();
         assert!(!a.always_control); // inherits global off
         assert!(b.always_control); // per-host override on
+    }
+
+    #[test]
+    fn remote_focus_actions_support_global_and_per_host_values() {
+        let c = parse_config(
+            "remote_focus_actions = [\"gpu-pane.ensure\"]\n\
+             [hosts.a]\ntarget = \"a\"\n\
+             [hosts.b]\ntarget = \"b\"\nremote_focus_actions = [\"layout.repair\"]\n",
+        )
+        .unwrap();
+        let a = c.hosts.iter().find(|h| h.name == "a").unwrap();
+        let b = c.hosts.iter().find(|h| h.name == "b").unwrap();
+        assert_eq!(a.remote_focus_actions, ["gpu-pane.ensure"]);
+        assert_eq!(b.remote_focus_actions, ["layout.repair"]);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use crate::api::{ApiClient, EventStream};
@@ -70,6 +70,19 @@ struct HostCtx {
     log: Logger,
     close_remote_on_local_close: bool,
     closes: crate::closes::Closes,
+}
+
+#[derive(Clone)]
+struct FocusRequest {
+    remote_workspace_id: String,
+}
+
+const FOCUS_ACTION_DEBOUNCE: Duration = Duration::from_millis(300);
+
+fn remote_workspace_for_local(state: &HostState, local_workspace_id: &str) -> Option<String> {
+    state.workspaces.iter().find_map(|(remote_id, entry)| {
+        (entry.local_id == local_workspace_id && !entry.is_tombstoned()).then(|| remote_id.clone())
+    })
 }
 
 const BROADCAST_SUBS: &[&str] = &[
@@ -187,6 +200,7 @@ fn remember_transport(
 async fn run_connected(
     ctx: &HostCtx,
     poke: &mut mpsc::Receiver<()>,
+    focus_poke: &mut watch::Receiver<Option<FocusRequest>>,
     backoff_idx: &mut usize,
     remembered_transport: &mut Option<crate::config::ApiTransport>,
     exec_streak: &mut u32,
@@ -220,11 +234,13 @@ async fn run_connected(
     let mut converge_at: Option<Instant> = None;
     let mut status_at: Option<Instant> = None;
     let mut closes_at: Option<Instant> = None;
+    let mut focus_at: Option<Instant> = None;
     let mut pending_status: HashMap<String, Value> = HashMap::new();
     let mut pending_closes: Vec<String> = Vec::new();
+    let mut pending_focus: Option<FocusRequest> = None;
 
     loop {
-        let sleep = sleep_until_earliest([converge_at, status_at, closes_at]);
+        let sleep = sleep_until_earliest([converge_at, status_at, closes_at, focus_at]);
         tokio::select! {
             ev = stream.next() => {
                 match ev {
@@ -259,6 +275,11 @@ async fn run_connected(
             Some(()) = poke.recv() => {
                 converge_at.get_or_insert(Instant::now());
             }
+            changed = focus_poke.changed() => {
+                changed.map_err(|_| err("focus event channel closed"))?;
+                pending_focus = focus_poke.borrow_and_update().clone();
+                focus_at = Some(Instant::now() + FOCUS_ACTION_DEBOUNCE);
+            }
             _ = sleep => {
                 let now = Instant::now();
                 if status_at.is_some_and(|t| t <= now) {
@@ -275,6 +296,29 @@ async fn run_connected(
                     apply_remote_closes(&ctx.local, &ctx.env_state_dir, &ctx.host.name, &closed, &ctx.log).await;
                     // reconcile + refresh subscriptions after the removals
                     converge_at.get_or_insert(now);
+                }
+                if focus_at.is_some_and(|t| t <= now) {
+                    focus_at = None;
+                    if let Some(request) = pending_focus.take() {
+                        let context = json!({
+                            "invocation_source": "mirror-focus",
+                            "workspace_id": request.remote_workspace_id,
+                        });
+                        for spec in &ctx.host.remote_focus_actions {
+                            if let Err(e) = crate::remote_action::invoke_connected(
+                                &remote,
+                                spec,
+                                context.clone(),
+                            )
+                            .await
+                            {
+                                ctx.log.log(&format!(
+                                    "[{}] remote focus action {spec} failed: {e}",
+                                    ctx.host.name
+                                ));
+                            }
+                        }
+                    }
                 }
                 if converge_at.is_some_and(|t| t <= now) {
                     converge_at = None;
@@ -296,7 +340,11 @@ async fn run_connected(
 const RECONNECT_DELAYS: [u64; 3] = [5, 10, 30];
 const DORMANT_DELAY: u64 = 300;
 
-async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
+async fn host_task(
+    ctx: HostCtx,
+    mut poke: mpsc::Receiver<()>,
+    mut focus_poke: watch::Receiver<Option<FocusRequest>>,
+) {
     let mut backoff_idx = 0usize;
     let mut was_dormant = false;
     // persists across reconnects for the daemon's whole lifetime — the
@@ -307,6 +355,7 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
         let e = match run_connected(
             &ctx,
             &mut poke,
+            &mut focus_poke,
             &mut backoff_idx,
             &mut remembered_transport,
             &mut exec_streak,
@@ -343,6 +392,7 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
         tokio::time::sleep(Duration::from_secs(delay)).await;
         // drain stale pokes accumulated while down (reconnect converges anyway)
         while poke.try_recv().is_ok() {}
+        focus_poke.borrow_and_update();
     }
 }
 
@@ -441,9 +491,11 @@ async fn heal_zombie_mirrors(
 
 // Local events: mirror closes drive tombstoning — poke every host so the
 /// next converge records the user's intent promptly.
+#[allow(clippy::too_many_arguments)]
 async fn local_events_task(
     local: ApiClient,
     pokers: Vec<mpsc::Sender<()>>,
+    focus_pokers: Vec<watch::Sender<Option<FocusRequest>>>,
     prefixes: Vec<String>,
     hosts: Vec<HostConfig>,
     state_dir: PathBuf,
@@ -453,6 +505,7 @@ async fn local_events_task(
     loop {
         let subs = vec![
             json!({ "type": "workspace.created" }),
+            json!({ "type": "workspace.focused" }),
             json!({ "type": "workspace.closed" }),
             json!({ "type": "tab.closed" }),
             json!({ "type": "pane.closed" }),
@@ -474,6 +527,25 @@ async fn local_events_task(
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 heal_zombie_mirrors(&local, &state_dir, &hosts, &pokers, &log).await;
                 while let Some(e) = stream.next().await {
+                    if e.event == "workspace_focused" {
+                        if let Some(local_workspace_id) =
+                            e.data.get("workspace_id").and_then(|v| v.as_str())
+                        {
+                            for (index, host) in hosts.iter().enumerate() {
+                                if host.remote_focus_actions.is_empty() {
+                                    continue;
+                                }
+                                let state = load_state(&state_dir, &host.name);
+                                if let Some(remote_workspace_id) =
+                                    remote_workspace_for_local(&state, local_workspace_id)
+                                {
+                                    focus_pokers[index]
+                                        .send_replace(Some(FocusRequest { remote_workspace_id }));
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     // A close EVENT is the authoritative "the user closed this";
                     // snapshot absence is not (rebuild/restart/failed converge).
                     // Our own closes are marked beforehand and swallowed here.
@@ -544,10 +616,13 @@ pub async fn cmd_run(env: Env) -> Result<()> {
     }
     let closes = crate::closes::new_closes();
     let mut pokers: Vec<mpsc::Sender<()>> = Vec::new();
+    let mut focus_pokers: Vec<watch::Sender<Option<FocusRequest>>> = Vec::new();
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for h in &config.hosts {
         let (tx, rx) = mpsc::channel(8);
         pokers.push(tx);
+        let (focus_tx, focus_rx) = watch::channel(None);
+        focus_pokers.push(focus_tx);
         let ctx = HostCtx {
             env_state_dir: env.state_dir.clone(),
             host: h.clone(),
@@ -556,12 +631,13 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             close_remote_on_local_close: config.close_remote_on_local_close,
             closes: closes.clone(),
         };
-        tasks.push(tokio::spawn(host_task(ctx, rx)));
+        tasks.push(tokio::spawn(host_task(ctx, rx, focus_rx)));
     }
     let prefixes: Vec<String> = config.hosts.iter().map(|h| h.prefix.clone()).collect();
     tasks.push(tokio::spawn(local_events_task(
         local.clone(),
         pokers.clone(),
+        focus_pokers,
         prefixes,
         config.hosts.clone(),
         env.state_dir.clone(),
@@ -824,6 +900,33 @@ pub async fn cmd_teardown(env: Env) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_maps_only_live_mirror_workspaces() {
+        let mut state = HostState::default();
+        state.workspaces.insert(
+            "rw1".into(),
+            crate::state::WsEntry {
+                local_id: "lw1".into(),
+                tombstone: None,
+                root_tab_local_id: None,
+                last_remote_label: None,
+            },
+        );
+        state.workspaces.insert(
+            "rw2".into(),
+            crate::state::WsEntry {
+                local_id: "lw2".into(),
+                tombstone: Some(true),
+                root_tab_local_id: None,
+                last_remote_label: None,
+            },
+        );
+
+        assert_eq!(remote_workspace_for_local(&state, "lw1").as_deref(), Some("rw1"));
+        assert_eq!(remote_workspace_for_local(&state, "lw2"), None);
+        assert_eq!(remote_workspace_for_local(&state, "local-only"), None);
+    }
 
     /// One fallback is not evidence: the probe also fails when the remote herdr
     /// is restarting or the mux hiccups, and pinning a healthy host to the
