@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::api::ApiClient;
 use crate::config::HostConfig;
-use crate::state::{load_state, save_state, HostState, PaneEntry, WsEntry};
+use crate::state::{load_state, save_state, HostState, PaneEntry, TabEntry, WsEntry};
 use crate::util::{Logger, Result};
 
 // --- snapshot shapes (subset of the API's SessionSnapshot) ---
@@ -665,6 +665,30 @@ fn pane_is_mirror(p: &PaneInfo) -> bool {
     is_marker(&p.foreground_cwd) || is_marker(&p.cwd)
 }
 
+/// Remote tab IDs whose local mirrors received an authoritative close event.
+///
+/// Snapshot absence alone is not enough because it also occurs during local
+/// server restore and failed layout rebuilds.
+fn remote_tabs_closed_locally(
+    tabs: &BTreeMap<String, TabEntry>,
+    local_tab_ids: &HashSet<&str>,
+    remote_tab_ids: &HashSet<&str>,
+    user_closed: &HashSet<String>,
+    close_remote: bool,
+) -> Vec<String> {
+    if !close_remote {
+        return Vec::new();
+    }
+    tabs.iter()
+        .filter(|(remote_id, entry)| {
+            !local_tab_ids.contains(entry.local_id.as_str())
+                && remote_tab_ids.contains(remote_id.as_str())
+                && user_closed.contains(&entry.local_id)
+        })
+        .map(|(remote_id, _)| remote_id.clone())
+        .collect()
+}
+
 // --- the converge pass ---
 
 /// Returns the post-converge state so callers don't re-read the state file.
@@ -711,6 +735,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         .workspaces
         .values()
         .map(|e| e.local_id.clone())
+        .chain(state.tabs.values().map(|e| e.local_id.clone()))
         .chain(state.panes.values().map(|e| e.local_id.clone()))
         .collect();
     let user_closed = match deps.closes.lock() {
@@ -765,6 +790,23 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     }
     for rid in drop_panes {
         state.panes.remove(&rid);
+    }
+    // A tab has no tombstone because closing it also closes all of its panes.
+    // Close the remote tab only when the local event stream proves that the
+    // missing local tab was a user action.
+    let tab_close_remote = remote_tabs_closed_locally(
+        &state.tabs,
+        &local_tab_ids,
+        &remote_tab_ids,
+        &user_closed,
+        close_remote,
+    );
+    for rid in &tab_close_remote {
+        log.log(&format!("tab mirror for {rid} closed locally — closing remote tab"));
+        if let Err(e) = deps.remote.request("tab.close", json!({ "tab_id": rid })).await {
+            log.log(&format!("remote tab close failed for {rid}: {e}"));
+        }
+        state.tabs.remove(rid);
     }
 
     // 2. remote objects that disappeared → close their mirrors. Explicit
@@ -993,6 +1035,11 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
 
     // 4. remote tabs → replicate layout with wrapper commands
     for rtab in &remote_snap.tabs {
+        // The snapshot was taken before the close request above. Do not rebuild
+        // a local mirror from that stale snapshot.
+        if tab_close_remote.contains(&rtab.tab_id) {
+            continue;
+        }
         let Some(ws_entry) = state.workspaces.get(&rtab.workspace_id).cloned() else { continue };
         if ws_entry.is_tombstoned() {
             continue;
@@ -1612,6 +1659,30 @@ mod tests {
 
     fn tombstoned(local_id: &str) -> PaneEntry {
         PaneEntry { local_id: local_id.into(), tombstone: Some(true), seq: 0, reported: None }
+    }
+
+    #[test]
+    fn remote_tab_close_requires_local_event_and_live_remote_tab() {
+        let tabs = BTreeMap::from([
+            (
+                "rt1".into(),
+                TabEntry { local_id: "lt1".into(), last_remote_label: None },
+            ),
+            (
+                "rt2".into(),
+                TabEntry { local_id: "lt2".into(), last_remote_label: None },
+            ),
+        ]);
+        let local = HashSet::from(["lt2"]);
+        let remote = HashSet::from(["rt1", "rt2"]);
+        let closed = HashSet::from(["lt1".to_string()]);
+
+        assert_eq!(
+            remote_tabs_closed_locally(&tabs, &local, &remote, &closed, true),
+            vec!["rt1".to_string()]
+        );
+        assert!(remote_tabs_closed_locally(&tabs, &local, &remote, &HashSet::new(), true).is_empty());
+        assert!(remote_tabs_closed_locally(&tabs, &local, &remote, &closed, false).is_empty());
     }
 
     /// A locally-closed (tombstoned) pane must not survive into the tree a tab
