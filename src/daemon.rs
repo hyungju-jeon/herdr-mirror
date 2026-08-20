@@ -2,6 +2,7 @@
 //
 //   herdr-mirror daemon       # foreground loop (what `start` spawns)
 //   herdr-mirror start        # spawn detached daemon, write pidfile
+//   herdr-mirror recover      # heal restored panes, then start and sync
 //   herdr-mirror pause        # halt syncing (sticky); mirrors stay, resume with start
 //   herdr-mirror ensure       # start only if not running (cheap event hook)
 //   herdr-mirror status       # print daemon/host/mirror state
@@ -396,7 +397,7 @@ async fn host_task(
     }
 }
 
-/// Does this local pane already have a live streamer?
+/// Does this local pane contain a streamer or other live work?
 ///
 /// Asks herdr what is actually running in the pane, rather than inferring it
 /// from a global `ps` scan and string-matching argv. That inference is what
@@ -407,12 +408,25 @@ async fn host_task(
 ///
 /// Generation-agnostic by construction — every streamer ever shipped is
 /// `herdr-mirror pane …`, whatever flags follow.
-async fn has_live_streamer(local: &ApiClient, pane_id: &str) -> Option<bool> {
+async fn pane_has_live_work(local: &ApiClient, pane_id: &str) -> Option<bool> {
     let v = local.request("pane.process_info", json!({ "pane_id": pane_id })).await.ok()?;
     let procs = v.pointer("/process_info/foreground_processes")?.as_array()?;
-    Some(procs.iter().any(|p| {
+    process_list_has_live_work(procs)
+}
+
+/// Classify one pane's foreground process list for safe stream healing.
+///
+/// `Some(false)` is deliberately narrow: only a known interactive shell is
+/// safe to replace. An SSH child, agent, or other non-shell process can belong
+/// to a live streamer whose wrapper is absent from the reported list.
+fn process_list_has_live_work(procs: &[Value]) -> Option<bool> {
+    if procs.iter().any(|p| {
         p.get("argv").and_then(|a| a.as_array()).is_some_and(|argv| is_streamer_argv(argv))
-    }))
+    }) {
+        return Some(true);
+    }
+    let leaf = procs.last()?.get("name")?.as_str()?;
+    Some(!crate::foreground::is_shell(leaf))
 }
 
 /// Is this foreground process one of our pane wrappers?
@@ -436,10 +450,9 @@ async fn heal_zombie_mirrors(
     local: &ApiClient,
     state_dir: &std::path::Path,
     hosts: &[HostConfig],
-    pokers: &[mpsc::Sender<()>],
     log: &Logger,
 ) {
-    for (i, h) in hosts.iter().enumerate() {
+    for h in hosts {
         let state = load_state(state_dir, &h.name);
         let panes: Vec<(String, String)> = state
             .panes
@@ -459,7 +472,7 @@ async fn heal_zombie_mirrors(
         // line into the user's live remote session instead.
         let mut dead: Vec<(String, String)> = Vec::new();
         for (remote_pane_id, local_pane_id) in panes {
-            if has_live_streamer(local, &local_pane_id).await == Some(false) {
+            if pane_has_live_work(local, &local_pane_id).await == Some(false) {
                 dead.push((remote_pane_id, local_pane_id));
             }
         }
@@ -485,7 +498,6 @@ async fn heal_zombie_mirrors(
             let argv = cmd_for(&remote_pane_id);
             crate::mirror::spawn_streamer_pane(local, state_dir, &local_pane_id, &argv, log).await;
         }
-        let _ = pokers[i].try_send(());
     }
 }
 
@@ -525,7 +537,7 @@ async fn local_events_task(
                 // subscribe succeeding after a drop = the server is back up;
                 // give session-restore a beat, then sweep for zombie mirrors
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                heal_zombie_mirrors(&local, &state_dir, &hosts, &pokers, &log).await;
+                heal_zombie_mirrors(&local, &state_dir, &hosts, &log).await;
                 while let Some(e) = stream.next().await {
                     if e.event == "workspace_focused" {
                         if let Some(local_workspace_id) =
@@ -614,6 +626,10 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             )
             .await;
     }
+    // Session restore can recreate mapped panes as plain shells. Repair those
+    // panes before host tasks start, so their initial converge cannot race the
+    // streamer re-exec.
+    heal_zombie_mirrors(&local, &env.state_dir, &config.hosts, &log).await;
     let closes = crate::closes::new_closes();
     let mut pokers: Vec<mpsc::Sender<()>> = Vec::new();
     let mut focus_pokers: Vec<watch::Sender<Option<FocusRequest>>> = Vec::new();
@@ -726,6 +742,22 @@ pub fn cmd_start(env: &Env) -> Result<()> {
         .spawn()?;
     fs::write(pid_path(env), child.id().to_string())?;
     println!("mirror daemon started (pid {})", child.id());
+    Ok(())
+}
+
+/// Repair mirror panes restored as plain shells, then start and poke the daemon.
+pub async fn cmd_recover(env: Env) -> Result<()> {
+    let log = Logger::new(&env.state_dir, true);
+    let config = load_config(&env.config_search)?;
+    let local = ApiClient::connect(&env.local_socket).await?;
+    heal_zombie_mirrors(&local, &env.state_dir, &config.hosts, &log).await;
+
+    set_paused(&env, false);
+    cmd_start(&env)?;
+    if let Some(pid) = running_pid(&env) {
+        unsafe { libc::kill(pid, libc::SIGUSR1) };
+    }
+    println!("mirror recovery complete");
     Ok(())
 }
 
@@ -977,6 +1009,33 @@ mod tests {
         // the ssh child sharing the same pane is not itself a streamer
         let ssh_child = argv(&["ssh", "-o", "BatchMode=yes", "vps", "exec ~/.local/bin/herdr ..."]);
         assert!(!is_streamer_argv(&ssh_child));
+    }
+
+    #[test]
+    fn healing_recognises_a_streamer_wrapper() {
+        let processes = vec![json!({
+            "name": "herdr-mirror",
+            "argv": ["/usr/local/bin/herdr-mirror", "pane", "vps", "w1:p1"]
+        })];
+        assert_eq!(process_list_has_live_work(&processes), Some(true));
+    }
+
+    #[test]
+    fn healing_replaces_only_a_known_plain_shell() {
+        let shell = vec![json!({ "name": "-zsh", "argv": ["-zsh"] })];
+        assert_eq!(process_list_has_live_work(&shell), Some(false));
+
+        let ssh = vec![json!({ "name": "ssh", "argv": ["ssh", "vps"] })];
+        assert_eq!(process_list_has_live_work(&ssh), Some(true));
+
+        let agent = vec![json!({ "name": "codex", "argv": ["codex"] })];
+        assert_eq!(process_list_has_live_work(&agent), Some(true));
+    }
+
+    #[test]
+    fn healing_stays_indeterminate_without_a_leaf_process() {
+        assert_eq!(process_list_has_live_work(&[]), None);
+        assert_eq!(process_list_has_live_work(&[json!({ "argv": ["unknown"] })]), None);
     }
 
     /// A docker pane's wrapper looks the same to this check — the whole point

@@ -96,6 +96,12 @@ back mirrors you closed.
 **Pause** — the **pause** action halts syncing; mirrors stay frozen in place
 and resume with **start**. `teardown` closes all mirrors and clears state.
 
+**Recover frozen panes** — after Herdr restores a session, a mirror pane can
+return as a plain shell without its streamer. Run the **recover** action or
+`herdr-mirror recover`. It replaces only known idle shell processes, then
+starts the daemon and requests an immediate sync. It does not replace an SSH
+child, agent, or other non-shell process.
+
 **Create on the remote** — four actions create objects on the remote host,
 inheriting the target host and cwd from the mirror you invoke them from (the
 same rule as native `prefix+shift+n`, but remote): `remote-new-workspace`,

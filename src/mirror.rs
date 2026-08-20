@@ -412,7 +412,7 @@ pub(crate) fn cmd_for_pane(
         // ssh only: the pane reuses the daemon's ControlMaster for cheap
         // foreground polls. Docker has no ControlMaster, and healing no longer
         // needs a host-identity token in the argv at all — it asks herdr what
-        // is running in each pane instead (see daemon::has_live_streamer).
+        // is running in each pane instead (see daemon::pane_has_live_work).
         match &kind {
             crate::config::HostKind::Ssh => {
                 argv.extend(["--ctl-path".into(), ctl_path.clone()]);

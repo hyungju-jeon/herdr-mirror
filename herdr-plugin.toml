@@ -24,6 +24,12 @@ description = "Pause syncing — mirror workspaces stay put; resume with start"
 command = ["./target/release/herdr-mirror", "pause"]
 
 [[actions]]
+id = "recover"
+title = "Mirror: recover frozen panes"
+description = "Restore missing pane streamers, start the daemon, and sync now"
+command = ["./target/release/herdr-mirror", "recover"]
+
+[[actions]]
 id = "status"
 title = "Mirror: status"
 description = "Log daemon, host, and mirror-object status"
