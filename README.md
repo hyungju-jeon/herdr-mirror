@@ -258,7 +258,11 @@ Mirror panes adapt to what's running on the remote pane:
 
 - at a **shell**, the mouse stays local — drag-select and copy work natively, and
   nothing leaks into the prompt;
-- in a **TUI** (vim, htop, lazygit, …), clicks and wheel forward to the app.
+- in a **TUI** (vim, htop, lazygit, …), a plain left drag selects the rendered
+  text and copies it on release, while a left click and other mouse buttons
+  forward to the app;
+- hold **Ctrl** during a left drag to forward the complete drag to the remote
+  TUI. Wheel events always use semantic remote scrolling.
 
 herdr's streamed frames don't carry the app's mouse mode, so the plugin infers it
 from the remote pane's foreground process — anything that isn't a known shell is

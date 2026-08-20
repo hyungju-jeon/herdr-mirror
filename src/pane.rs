@@ -484,6 +484,11 @@ fn mouse_action(remote_is_shell: Option<bool>, btn: u32, press: bool) -> MouseAc
     }
 }
 
+/// Plain left gestures select locally. Ctrl+left is reserved for remote drag.
+fn is_local_selection_gesture(btn: u32) -> bool {
+    btn & 64 == 0 && (btn & 0b11) == 0 && btn & 16 == 0
+}
+
 fn contains_wheel_press(bytes: &[u8]) -> bool {
     let mut i = 0;
     while i < bytes.len() {
@@ -580,6 +585,32 @@ pub(crate) fn split_paste(buf: &mut Vec<u8>, chunk: Vec<u8>) -> PasteSplit {
 
 fn has_mouse_seq(bytes: &[u8]) -> bool {
     bytes.windows(3).any(|w| w == [0x1b, b'[', b'<'])
+}
+
+/// Longest mouse packet accepted before a partial packet is released as input.
+const MAX_MOUSE_LEN: usize = 32;
+
+fn is_partial_mouse(rest: &[u8]) -> bool {
+    rest.len() >= 3
+        && rest[0] == 0x1b
+        && rest[1] == b'['
+        && rest[2] == b'<'
+        && rest[3..].iter().all(|&b| b.is_ascii_digit() || b == b';')
+}
+
+/// Return the start of an incomplete SGR mouse packet at the end of `bytes`.
+fn incomplete_mouse_suffix(bytes: &[u8]) -> usize {
+    let window = bytes.len().saturating_sub(MAX_MOUSE_LEN);
+    for start in (window..bytes.len()).rev() {
+        if bytes[start] != 0x1b {
+            continue;
+        }
+        if parse_mouse(bytes, start).is_some() {
+            return bytes.len();
+        }
+        return if is_partial_mouse(&bytes[start..]) { start } else { bytes.len() };
+    }
+    bytes.len()
 }
 
 /// Convert only the macOS editing keys that remote shells and TUIs do not
@@ -700,6 +731,9 @@ struct App {
     /// scheduled delayed re-poll to catch a foreground change the last input just
     /// caused (e.g. quitting a TUI back to a shell); bypasses the throttle
     settle_at: Option<Instant>,
+    /// Retry a failed initial foreground classification without waiting for a
+    /// keyboard event. Cleared after the first definite result.
+    classify_retry_at: Option<Instant>,
     /// whether the local mouse grab (?1002h) is currently on. Released at a shell
     /// so herdr does native selection/scroll; re-grabbed for a TUI so clicks can
     /// be forwarded.
@@ -707,6 +741,16 @@ struct App {
     /// whether the local pane is currently in application cursor mode (?1h), held
     /// to match the remote's so forwarded arrows arrive in the form it expects
     app_cursor_keys: bool,
+    /// Incomplete SGR mouse input held until the next terminal read.
+    mouse_tail: Vec<u8>,
+    /// Remote/local decision fixed at a non-selection button press until release.
+    drag_forward: Option<bool>,
+    /// A plain left press is held until release proves it was a click or motion
+    /// turns it into local selection.
+    pending_left: Option<PendingLeft>,
+    /// Active grid selection as (anchor, head), each in (column, row) order.
+    selection: Option<((usize, usize), (usize, usize))>,
+    selection_dragging: bool,
     paste_inflight: bool,
     /// partially-received bracketed paste (see `intercept_paste`)
     paste_buf: Vec<u8>,
@@ -715,6 +759,12 @@ struct App {
     /// the payload that started the in-flight upload, so it can be forwarded
     /// unchanged when every path turns out to exist on the remote already
     paste_original: Option<Vec<u8>>,
+}
+
+struct PendingLeft {
+    grid: (usize, usize),
+    raw: Vec<u8>,
+    forward_click: bool,
 }
 
 /// minimum spacing between foreground polls — each is an ssh handshake, so we
@@ -726,6 +776,84 @@ const FG_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 const SETTLE_DELAY: Duration = Duration::from_millis(350);
 
 impl App {
+    fn mouse_to_grid(&self, mouse_col: u32, mouse_row: u32) -> (usize, usize) {
+        let (_, out_rows) = term_size();
+        let bottom = self.grid.content_bottom.max(self.grid.cursor_row);
+        let offset_row = (bottom + 1).saturating_sub(out_rows);
+        let col = (mouse_col as usize).saturating_sub(1).min(self.grid.width.saturating_sub(1));
+        let row = (mouse_row as usize).saturating_sub(1) + offset_row;
+        (col, row)
+    }
+
+    fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
+        let (a, b) = self.selection?;
+        Some(if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) })
+    }
+
+    fn selection_row_span(
+        &self,
+        row: usize,
+        start: (usize, usize),
+        end: (usize, usize),
+    ) -> Option<(usize, usize)> {
+        if row < start.1 || row > end.1 {
+            return None;
+        }
+        let last_col = self.grid.width.saturating_sub(1);
+        let first = if row == start.1 { start.0 } else { 0 };
+        let last = if row == end.1 { end.0 } else { last_col };
+        Some((first.min(last_col), last.min(last_col)))
+    }
+
+    fn selection_text(&self) -> Option<String> {
+        let (start, end) = self.selection_bounds()?;
+        let mut lines = Vec::new();
+        for row in start.1..=end.1 {
+            let (first, last) = self.selection_row_span(row, start, end)?;
+            let mut line = String::new();
+            if let Some(cells) = self.grid.rows.get(row) {
+                for col in first..=last {
+                    line.push(cells.get(col).and_then(|cell| cell.as_ref()).map_or(' ', |cell| cell.ch));
+                }
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        let text = lines.join("\n");
+        (!text.trim().is_empty()).then_some(text)
+    }
+
+    fn selection_overlay(&self, out_cols: usize, out_rows: usize) -> String {
+        let Some((start, end)) = self.selection_bounds() else { return String::new() };
+        let bottom = self.grid.content_bottom.max(self.grid.cursor_row);
+        let offset_row = (bottom + 1).saturating_sub(out_rows);
+        let mut out = String::new();
+        for row in start.1..=end.1 {
+            let terminal_row = row as isize - offset_row as isize;
+            if terminal_row < 0 || terminal_row as usize >= out_rows {
+                continue;
+            }
+            let Some((first, last)) = self.selection_row_span(row, start, end) else { continue };
+            let last = last.min(out_cols.saturating_sub(1));
+            if first > last {
+                continue;
+            }
+            out.push_str(&format!("\x1b[{};{}H\x1b[7m", terminal_row + 1, first + 1));
+            if let Some(cells) = self.grid.rows.get(row) {
+                for col in first..=last {
+                    out.push(cells.get(col).and_then(|cell| cell.as_ref()).map_or(' ', |cell| cell.ch));
+                }
+            }
+            out.push_str("\x1b[0m");
+        }
+        out
+    }
+
+    fn copy_selection(&self) {
+        if let Some(text) = self.selection_text() {
+            write_stdout(&format!("\x1b]52;c;{}\x07", B64.encode(text.as_bytes())));
+        }
+    }
+
     fn paint(&mut self) {
         if !self.tty {
             return;
@@ -736,14 +864,22 @@ impl App {
         }
         let (cols, rows) = term_size();
         let mut out = self.renderer.paint(&self.grid, cols, rows);
+        const SYNC_END: &str = "\x1b[?2026l";
         // inject the prediction overlay inside the synchronized-update block
         let overlay = self.predict.overlay(&self.grid, cols, rows);
         if !overlay.is_empty() {
-            const SYNC_END: &str = "\x1b[?2026l";
             if let Some(pos) = out.rfind(SYNC_END) {
                 out.insert_str(pos, &overlay);
             } else {
                 out.push_str(&overlay);
+            }
+        }
+        let selection = self.selection_overlay(cols, rows);
+        if !selection.is_empty() {
+            if let Some(pos) = out.rfind(SYNC_END) {
+                out.insert_str(pos, &selection);
+            } else {
+                out.push_str(&selection);
             }
         }
         write_stdout(&out);
@@ -890,8 +1026,13 @@ impl App {
                     self.pending_input.clear();
                 }
                 self.session = Some(s);
-                // warm the foreground classification before the user mouses
+                // Warm the foreground classification before the user mouses.
+                // Retry while it remains unknown so a mouse-only pane does not
+                // stay unclassified after one transient poll failure.
                 self.spawn_foreground_poll(false);
+                if m == Mode::Control {
+                    self.classify_retry_at = Some(Instant::now() + Duration::from_millis(600));
+                }
                 // always-control has no release, so no "ctrl+\ to release" hint
                 self.renderer.status(
                     if m == Mode::Control && !self.args.always_control {
@@ -1149,6 +1290,22 @@ impl App {
             });
             return;
         }
+        // Paste framing has already run in `handle_stdin`. Reassemble only raw
+        // SGR mouse input here so a split packet cannot leak text to the remote.
+        let mut buf = if self.mouse_tail.is_empty() {
+            buf
+        } else {
+            let mut joined = std::mem::take(&mut self.mouse_tail);
+            joined.extend_from_slice(&buf);
+            joined
+        };
+        let cut = incomplete_mouse_suffix(&buf);
+        if cut < buf.len() {
+            self.mouse_tail = buf.split_off(cut);
+        }
+        if buf.is_empty() {
+            return;
+        }
         if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
             // no quit key: the wrapper's lifecycle belongs to the hosting pane
             if has_mouse_seq(&buf) {
@@ -1205,9 +1362,88 @@ impl App {
         let mut rest: Vec<u8> = Vec::with_capacity(buf.len());
         let mut i = 0usize;
         let mut scrolls: Vec<serde_json::Value> = Vec::new();
+        let mut repaint_selection = false;
+        let mut typed = false;
         while i < buf.len() {
             if let Some((btn, x, y, press, len)) = parse_mouse(&buf, i) {
-                match mouse_action(self.remote_is_shell, btn, press) {
+                let raw = &buf[i..i + len];
+                let is_motion = btn & 32 != 0;
+                let is_wheel = btn & 64 != 0;
+
+                // A plain left press is delayed. A matching release becomes a
+                // remote click, while motion converts the gesture into local
+                // text selection. Ctrl+left bypasses selection and forwards a
+                // complete remote drag.
+                if is_local_selection_gesture(btn) {
+                    if press && !is_motion {
+                        self.selection = None;
+                        self.selection_dragging = false;
+                        self.pending_left = Some(PendingLeft {
+                            grid: self.mouse_to_grid(x, y),
+                            raw: raw.to_vec(),
+                            forward_click: self.remote_is_shell == Some(false),
+                        });
+                        self.renderer.invalidate();
+                        repaint_selection = true;
+                    } else if is_motion {
+                        if let Some(pending) = &self.pending_left {
+                            let anchor = pending.grid;
+                            self.selection = Some((anchor, self.mouse_to_grid(x, y)));
+                            self.selection_dragging = true;
+                            self.renderer.invalidate();
+                            repaint_selection = true;
+                        }
+                    } else if !press {
+                        if self.selection_dragging {
+                            self.selection_dragging = false;
+                            self.pending_left = None;
+                            if self.selection.is_some_and(|(a, b)| a != b) {
+                                self.copy_selection();
+                                self.hint("copied to clipboard");
+                            } else {
+                                self.selection = None;
+                                self.renderer.invalidate();
+                            }
+                            repaint_selection = true;
+                        } else if let Some(pending) = self.pending_left.take() {
+                            if pending.forward_click {
+                                rest.extend_from_slice(&pending.raw);
+                                rest.extend_from_slice(raw);
+                            }
+                        }
+                    }
+                    i += len;
+                    continue;
+                }
+
+                if press && self.selection.is_some() {
+                    self.selection = None;
+                    self.selection_dragging = false;
+                    self.pending_left = None;
+                    self.renderer.invalidate();
+                    repaint_selection = true;
+                }
+
+                let action = if is_wheel {
+                    mouse_action(self.remote_is_shell, btn, press)
+                } else if is_motion || !press {
+                    if self.drag_forward == Some(true) {
+                        MouseAction::ForwardRaw
+                    } else {
+                        MouseAction::Drop
+                    }
+                } else {
+                    if self.remote_is_shell.is_none() {
+                        self.spawn_foreground_poll(true);
+                    }
+                    let action = mouse_action(self.remote_is_shell, btn, press);
+                    self.drag_forward = Some(action == MouseAction::ForwardRaw);
+                    action
+                };
+                if !press && !is_wheel {
+                    self.drag_forward = None;
+                }
+                match action {
                     MouseAction::Scroll { up } => {
                         scrolls.push(json!({
                             "type": "terminal.scroll",
@@ -1219,14 +1455,25 @@ impl App {
                             "modifiers": 0,
                         }));
                     }
-                    MouseAction::ForwardRaw => rest.extend_from_slice(&buf[i..i + len]),
+                    MouseAction::ForwardRaw => rest.extend_from_slice(raw),
                     MouseAction::Drop => {}
                 }
                 i += len;
             } else {
                 rest.push(buf[i]);
                 i += 1;
+                typed = true;
             }
+        }
+        if typed && self.selection.is_some() {
+            self.selection = None;
+            self.selection_dragging = false;
+            self.pending_left = None;
+            self.renderer.invalidate();
+            repaint_selection = true;
+        }
+        if repaint_selection {
+            self.paint();
         }
         for s in scrolls {
             self.send(s).await;
@@ -1364,10 +1611,16 @@ pub async fn run(args: Args) -> Result<()> {
         remote_is_shell: None,
         fg_poll_at: None,
         settle_at: None,
+        classify_retry_at: None,
         mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
         // startup leaves the pane in normal cursor mode; the first classification
         // moves it if the remote turns out to be a TUI
         app_cursor_keys: false,
+        mouse_tail: Vec::new(),
+        drag_forward: None,
+        pending_left: None,
+        selection: None,
+        selection_dragging: false,
         paste_inflight: false,
         paste_buf: Vec::new(),
         paste_queue: Vec::new(),
@@ -1415,6 +1668,7 @@ pub async fn run(args: Args) -> Result<()> {
             idle_at,
             app.predict.deadline(),
             app.settle_at,
+            app.classify_retry_at,
         ]);
 
         tokio::select! {
@@ -1427,6 +1681,7 @@ pub async fn run(args: Args) -> Result<()> {
                     // keep the last good classification if a poll failed (None)
                     Some(Msg::Foreground(v)) => if v.is_some() {
                         app.remote_is_shell = v;
+                        app.classify_retry_at = None;
                         app.sync_mouse_grab();
                         app.sync_cursor_key_mode();
                     },
@@ -1482,6 +1737,17 @@ pub async fn run(args: Args) -> Result<()> {
                 if app.settle_at.is_some_and(|t| t <= now) {
                     app.settle_at = None;
                     app.spawn_foreground_poll(true); // forced: bypass the throttle
+                }
+                if app.classify_retry_at.is_some_and(|t| t <= now) {
+                    if app.remote_is_shell.is_none()
+                        && app.mode == Mode::Control
+                        && app.session.is_some()
+                    {
+                        app.spawn_foreground_poll(true);
+                        app.classify_retry_at = Some(now + Duration::from_millis(1200));
+                    } else {
+                        app.classify_retry_at = None;
+                    }
                 }
                 if app.predict.deadline().is_some_and(|t| t <= now) {
                     app.predict.on_tick(); // wipe timed-out ghosts (no-echo prompts)
@@ -1563,6 +1829,25 @@ mod tests {
         assert!(!contains_wheel_press(b"\x1b[<64;10;5m")); // release, not press
         assert!(has_mouse_seq(b"xx\x1b[<0;1;1Myy"));
         assert!(!has_mouse_seq(b"plain text"));
+    }
+
+    #[test]
+    fn mouse_packets_split_across_reads_are_held() {
+        assert_eq!(incomplete_mouse_suffix(b"\x1b[<0;53;51M"), 11);
+        for cut in 3..11 {
+            assert_eq!(incomplete_mouse_suffix(&b"\x1b[<0;53;51M"[..cut]), 0);
+        }
+        assert_eq!(incomplete_mouse_suffix(b"key\x1b[<0;5"), 3);
+        assert_eq!(incomplete_mouse_suffix(b"\x1b[13;2u"), 7);
+    }
+
+    #[test]
+    fn plain_left_selects_but_ctrl_left_forwards() {
+        assert!(is_local_selection_gesture(0));
+        assert!(is_local_selection_gesture(32)); // plain left motion
+        assert!(!is_local_selection_gesture(16)); // Ctrl+left press
+        assert!(!is_local_selection_gesture(48)); // Ctrl+left motion
+        assert!(!is_local_selection_gesture(64)); // wheel
     }
 
     #[test]
