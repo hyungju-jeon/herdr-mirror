@@ -252,6 +252,12 @@ nothing on the remote, so the files are uploaded to
 `~/.cache/herdr-mirror/pastes/` there and the remote path is pasted instead,
 ready for an agent to open.
 
+If the local Herdr client does not pass Ctrl+V to pane input, use the
+**Mirror: paste clipboard image** action. You can bind `mirror.paste-image` to
+a non-conflicting key such as `prefix+v`. The action sends Ctrl+V directly to
+the focused pane process. Mirror panes upload the image; normal local panes
+receive their usual Ctrl+V input.
+
 Any file type, several at once, up to 32MB each. Ordinary pastes pass through
 untouched, and paths that already exist on the remote are left alone. Reading
 an image off the clipboard needs `wl-paste` or `xclip` on Linux (macOS and

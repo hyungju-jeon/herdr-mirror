@@ -42,6 +42,12 @@ description = "One-shot mirror pass without starting the daemon"
 command = ["./target/release/herdr-mirror", "once"]
 
 [[actions]]
+id = "paste-image"
+title = "Mirror: paste clipboard image"
+description = "Send image paste to the focused mirror or normal local pane"
+command = ["./target/release/herdr-mirror", "paste-image"]
+
+[[actions]]
 id = "remote-new-workspace"
 title = "Mirror: new workspace"
 description = "New workspace on the remote host (the invoking mirror's host, else hosts.toml default_host)"

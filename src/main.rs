@@ -3,7 +3,7 @@
 //
 //   herdr-mirror daemon                 # control plane (foreground; `start` spawns this)
 //   herdr-mirror pane <host> <target>   # data plane: one per mirror pane
-//   herdr-mirror start|pause|recover|ensure|status|once|restore|teardown
+//   herdr-mirror start|pause|recover|ensure|status|once|restore|teardown|paste-image
 //   herdr-mirror remote-workspace|remote-tab|remote-split <right|down>
 //   herdr-mirror remote-invoke <plugin>.<action>
 //   herdr-mirror remote-actions [host]              # discovery
@@ -73,6 +73,7 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             Ok(())
         }
         "recover" => rt.block_on(daemon::cmd_recover(Env::resolve()?)),
+        "paste-image" => paste::cmd_paste_image(),
         "ensure" => {
             // workspace.focused hook — must be cheap and silent
             daemon::cmd_ensure(&Env::resolve()?);
@@ -118,7 +119,7 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             rt.block_on(binding::unbind(Env::resolve()?, what))
         }
         other => Err(util::err(format!(
-            "unknown command: {other} (daemon|pane|start|pause|recover|ensure|status|once|restore|teardown|remote-workspace|remote-tab|remote-split|remote-invoke|remote-actions|bind|unbind)"
+            "unknown command: {other} (daemon|pane|start|pause|recover|ensure|status|once|restore|teardown|paste-image|remote-workspace|remote-tab|remote-split|remote-invoke|remote-actions|bind|unbind)"
         ))),
     }
 }

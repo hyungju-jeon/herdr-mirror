@@ -14,6 +14,36 @@ const REMOTE_DIR: &str = ".cache/herdr-mirror/pastes";
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(5);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(20);
 
+fn focused_pane_id(plugin_context: Option<&str>, active_pane: Option<&str>) -> Option<String> {
+    plugin_context
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .and_then(|value| value.get("focused_pane_id")?.as_str().map(str::to_owned))
+        .or_else(|| active_pane.filter(|id| !id.is_empty()).map(str::to_owned))
+}
+
+/// Ask Herdr to send Ctrl+V directly to the focused pane process.
+///
+/// This gives image paste a command-palette or prefix-key path when a local
+/// Herdr client does not pass the physical Ctrl+V key to pane stdin. A mirror
+/// wrapper intercepts the injected key and uploads the local clipboard image;
+/// an ordinary local pane receives its normal Ctrl+V input.
+pub fn cmd_paste_image() -> Result<()> {
+    let plugin_context = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").ok();
+    let active_pane = std::env::var("HERDR_ACTIVE_PANE_ID").ok();
+    let pane_id = focused_pane_id(plugin_context.as_deref(), active_pane.as_deref())
+        .ok_or_else(|| err("paste-image: no focused pane in the Herdr action context"))?;
+    let herdr = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let status = std::process::Command::new(herdr)
+        .args(["pane", "send-keys", &pane_id, "ctrl+v"])
+        .status()
+        .map_err(|e| err(format!("paste-image: cannot run Herdr: {e}")))?;
+    if !status.success() {
+        return Err(err(format!("paste-image: Herdr send-keys failed with {status}")));
+    }
+    println!("sent image-paste request to pane {pane_id}");
+    Ok(())
+}
+
 pub enum Outcome {
     Pasted(String),
     NoImage,
@@ -377,6 +407,16 @@ async fn read_capped(path: &std::path::Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_paste_action_uses_plugin_context_then_shell_context() {
+        assert_eq!(
+            focused_pane_id(Some(r#"{"focused_pane_id":"p7"}"#), Some("p8")).as_deref(),
+            Some("p7")
+        );
+        assert_eq!(focused_pane_id(Some("bad json"), Some("p8")).as_deref(), Some("p8"));
+        assert_eq!(focused_pane_id(None, Some("")), None);
+    }
 
     #[test]
     fn osascript_data_literal_decodes() {
