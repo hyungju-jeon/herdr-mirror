@@ -582,6 +582,37 @@ fn has_mouse_seq(bytes: &[u8]) -> bool {
     bytes.windows(3).any(|w| w == [0x1b, b'[', b'<'])
 }
 
+/// Convert only the macOS editing keys that remote shells and TUIs do not
+/// normally decode from Kitty keyboard protocol sequences.
+fn normalize_macos_edit_keys(bytes: &[u8]) -> Vec<u8> {
+    const KEYS: &[(&[u8], &[u8])] = &[
+        (b"\x1b[98;3u", b"\x1bb"),     // Option+Left
+        (b"\x1b[102;3u", b"\x1bf"),    // Option+Right
+        (b"\x1b[1;3D", b"\x1bb"),      // alternate Option+Left encoding
+        (b"\x1b[1;3C", b"\x1bf"),      // alternate Option+Right encoding
+        (b"\x1b[127;3u", b"\x1b\x7f"), // Option+Delete
+        (b"\x1b[117;5u", b"\x15"),     // Ghostty Command+Delete
+        (b"\x1b[127;9u", b"\x15"),     // direct Command+Delete
+        (b"\x1b[1;9D", b"\x01"),       // Command+Left
+        (b"\x1b[1;9C", b"\x05"),       // Command+Right
+    ];
+
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if let Some((encoded, legacy)) =
+            KEYS.iter().find(|(encoded, _)| bytes[at..].starts_with(encoded))
+        {
+            out.extend_from_slice(legacy);
+            at += encoded.len();
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    out
+}
+
 
 // ---------------------------------------------------------------------------
 // the wrapper state machine
@@ -1135,7 +1166,7 @@ impl App {
             }
             // any keystroke takes control and is delivered once the session is up
             self.control_sticky = false;
-            self.pending_input.push(buf);
+            self.pending_input.push(normalize_macos_edit_keys(&buf));
             self.switch_mode(Mode::Control);
             return;
         }
@@ -1201,6 +1232,7 @@ impl App {
             self.send(s).await;
         }
         if !rest.is_empty() {
+            let rest = normalize_macos_edit_keys(&rest);
             let msg = json!({ "type": "terminal.input", "bytes": B64.encode(&rest) });
             self.send(msg).await;
             // optimistic local echo: draw the keystroke now, verify on frame
@@ -1280,7 +1312,10 @@ pub async fn run(args: Args) -> Result<()> {
         // drop otherwise arrives as bare text with no terminator at all. The
         // framing is stripped only to recognise a drop and put back on the way
         // out (`route_paste_body`), so the remote app still sees a paste.
-        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h\x1b[?2004h");
+        // Kitty disambiguation keeps Shift+Enter distinct from Enter. Mirror
+        // renders frames, so a mode enabled by the remote TUI does not reach
+        // this local terminal unless the streamer enables it here.
+        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>1u");
         RawMode::enable()
     } else {
         None
@@ -1467,7 +1502,9 @@ pub async fn run(args: Args) -> Result<()> {
     if tty {
         // ?1l with the rest: leaving the hosting pane in application cursor mode
         // would misencode arrows for whatever runs there next
-        write_stdout("\x1b[?2004l\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?25h\x1b[?1049l");
+        // Kitty mode stacks are alternate-screen specific, so pop it before
+        // leaving that screen.
+        write_stdout("\x1b[?2004l\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?25h\x1b[<u\x1b[?1049l");
     }
     if let Some(raw) = raw {
         raw.restore();
@@ -1526,6 +1563,25 @@ mod tests {
         assert!(!contains_wheel_press(b"\x1b[<64;10;5m")); // release, not press
         assert!(has_mouse_seq(b"xx\x1b[<0;1;1Myy"));
         assert!(!has_mouse_seq(b"plain text"));
+    }
+
+    #[test]
+    fn restores_macos_edit_keys_from_kitty_encoding() {
+        assert_eq!(normalize_macos_edit_keys(b"\x1b[98;3u"), b"\x1bb");
+        assert_eq!(normalize_macos_edit_keys(b"\x1b[102;3u"), b"\x1bf");
+        assert_eq!(normalize_macos_edit_keys(b"\x1b[127;3u"), b"\x1b\x7f");
+        assert_eq!(normalize_macos_edit_keys(b"\x1b[117;5u"), b"\x15");
+        assert_eq!(normalize_macos_edit_keys(b"\x1b[127;9u"), b"\x15");
+        assert_eq!(normalize_macos_edit_keys(b"\x1b[1;9D"), b"\x01");
+        assert_eq!(normalize_macos_edit_keys(b"\x1b[1;9C"), b"\x05");
+    }
+
+    #[test]
+    fn leaves_shift_enter_and_unrelated_keys_unchanged() {
+        assert_eq!(
+            normalize_macos_edit_keys(b"a\x1b[13;2u\x1b[1;2D"),
+            b"a\x1b[13;2u\x1b[1;2D"
+        );
     }
 
 
