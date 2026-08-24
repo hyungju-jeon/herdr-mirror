@@ -261,10 +261,26 @@ fn map_status(remote: &str) -> &'static str {
         "working" => "working",
         "blocked" => "blocked",
         "idle" => "idle",
-        // local herdr derives "done" from working→idle while unseen
+        // pane.report_agent cannot accept done. Herdr derives it from the
+        // working→idle sequence returned by report_states below.
         "done" => "idle",
         _ => "unknown",
     }
+}
+
+/// Return the local states for one authoritative remote lifecycle state.
+/// Reconstruct `done` once because the local API accepts no `done` value.
+fn report_states(remote: &str, last_remote: Option<&str>) -> Vec<&'static str> {
+    if remote == "done" && last_remote != Some("done") {
+        vec!["working", "idle"]
+    } else {
+        vec![map_status(remote)]
+    }
+}
+
+/// Return true when transport loss invalidates the displayed state.
+fn should_mark_unknown(last_remote: Option<&str>) -> bool {
+    last_remote != Some("done")
 }
 
 pub fn mirror_source(host_name: &str) -> String {
@@ -1128,7 +1144,13 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     let seq = state.panes.get(rid).map(|e| e.seq).unwrap_or(0);
                     state.panes.insert(
                         rid.clone(),
-                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq, reported: None },
+                        PaneEntry {
+                            local_id: local_id.clone(),
+                            tombstone: None,
+                            seq,
+                            reported: None,
+                            last_remote_status: None,
+                        },
                     );
                     // plain pane created above; exec the streamer into it
                     spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(rid), &deps.log).await;
@@ -1190,7 +1212,13 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         .await;
                     state.panes.insert(
                         place.pane.clone(),
-                        PaneEntry { local_id, tombstone: None, seq: 0, reported: None },
+                        PaneEntry {
+                            local_id,
+                            tombstone: None,
+                            seq: 0,
+                            reported: None,
+                            last_remote_status: None,
+                        },
                     );
                 }
                 // A pane whose remote sibling is a multi-pane subtree can't be
@@ -1225,7 +1253,13 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         .await;
                     state.panes.insert(
                         rp.pane_id.clone(),
-                        PaneEntry { local_id, tombstone: None, seq: 0, reported: None },
+                        PaneEntry {
+                            local_id,
+                            tombstone: None,
+                            seq: 0,
+                            reported: None,
+                            last_remote_status: None,
+                        },
                     );
                 }
             }
@@ -1327,7 +1361,6 @@ pub async fn push_pane_status(
     let source = mirror_source(host_name);
     match agent {
         Some(agent) => {
-            entry.seq += 1;
             let display = agent.display_agent.clone().or_else(|| agent.agent.clone());
             // Identity is the remote's CANONICAL id ("claude"), not the pretty
             // name: herdr canonicalizes a reported label, so this resolves the
@@ -1344,18 +1377,27 @@ pub async fn push_pane_status(
             // no synthetic "@host" marker (clear any stale one)
             let custom: Option<String> = agent.custom_status.as_deref().map(clamp_status);
             let status = agent.agent_status.as_deref().unwrap_or("unknown");
-            let mut report = json!({
-                "pane_id": entry.local_id,
-                "source": source,
-                "agent": label,
-                "state": map_status(status),
-                "seq": entry.seq,
-            });
-            if let Some(c) = &custom {
-                report["custom_status"] = json!(c);
+            let mut status_reported = true;
+            for local_status in report_states(status, entry.last_remote_status.as_deref()) {
+                entry.seq += 1;
+                let mut report = json!({
+                    "pane_id": entry.local_id,
+                    "source": source,
+                    "agent": label,
+                    "state": local_status,
+                    "seq": entry.seq,
+                });
+                if let Some(c) = &custom {
+                    report["custom_status"] = json!(c);
+                }
+                if let Err(e) = local.request("pane.report_agent", report).await {
+                    log.log(&format!("report_agent {}: {e}", entry.local_id));
+                    status_reported = false;
+                    break;
+                }
             }
-            if let Err(e) = local.request("pane.report_agent", report).await {
-                log.log(&format!("report_agent {}: {e}", entry.local_id));
+            if status_reported {
+                entry.last_remote_status = Some(status.to_string());
             }
             // forward the remote's own tokens so a mirrored agent row carries the
             // same values a native one does, under whatever layout is configured
@@ -1376,6 +1418,7 @@ pub async fn push_pane_status(
             entry.reported = Some(label);
         }
         None => {
+            entry.last_remote_status = None;
             let Some(reported) = entry.reported.clone() else { return };
             // remote agent exited — retract our claim so the mirror pane doesn't
             // show a phantom agent row forever
@@ -1460,16 +1503,17 @@ pub async fn push_statuses(deps: &ConvergeDeps, remote_snap: &Snapshot, state: &
     }
 }
 
-/// Mark mirrored agents unknown (ssh drop) — statuses recover on reconnect.
-/// Only panes we actually reported an agent onto; inventing agent rows for
-/// plain mirrored terminals pollutes the agents panel.
+/// Mark active mirrored agents unknown after an SSH drop. Completed agents keep
+/// their state, so reconnect cannot create a second completion transition.
+/// Only panes we actually reported an agent onto; inventing agent rows for plain
+/// mirrored terminals pollutes the agents panel.
 pub async fn mark_unknown(local: &ApiClient, state_dir: &std::path::Path, host_name: &str, reason: &str) {
     let mut state = load_state(state_dir, host_name);
     let source = mirror_source(host_name);
     let custom = clamp_status(reason);
     for entry in state.panes.values_mut() {
         let Some(reported) = entry.reported.clone() else { continue };
-        if entry.is_tombstoned() {
+        if entry.is_tombstoned() || !should_mark_unknown(entry.last_remote_status.as_deref()) {
             continue;
         }
         entry.seq += 1;
@@ -1659,7 +1703,13 @@ mod tests {
     }
 
     fn tombstoned(local_id: &str) -> PaneEntry {
-        PaneEntry { local_id: local_id.into(), tombstone: Some(true), seq: 0, reported: None }
+        PaneEntry {
+            local_id: local_id.into(),
+            tombstone: Some(true),
+            seq: 0,
+            reported: None,
+            last_remote_status: None,
+        }
     }
 
     #[test]
@@ -1697,7 +1747,13 @@ mod tests {
         let mut panes: BTreeMap<String, PaneEntry> = BTreeMap::new();
         panes.insert(
             "p1".into(),
-            PaneEntry { local_id: "l1".into(), tombstone: None, seq: 0, reported: None },
+            PaneEntry {
+                local_id: "l1".into(),
+                tombstone: None,
+                seq: 0,
+                reported: None,
+                last_remote_status: None,
+            },
         );
         let mut ids = Vec::new();
         walk_pane_ids(&prune_closed(&tree, &panes).unwrap(), &mut ids);
@@ -1973,6 +2029,27 @@ mod tests {
             resolve_label(None, "2", "notes", Some("2")),
             LabelAction::PushRemote("notes".into())
         );
+    }
+
+    /// Reconstruct remote completion once, including after a missed transition.
+    #[test]
+    fn remote_agent_status_maps_to_reportable_states() {
+        assert_eq!(report_states("working", None), ["working"]);
+        assert_eq!(report_states("blocked", None), ["blocked"]);
+        assert_eq!(report_states("idle", None), ["idle"]);
+        assert_eq!(report_states("done", None), ["working", "idle"]);
+        assert_eq!(report_states("done", Some("working")), ["working", "idle"]);
+        assert_eq!(report_states("done", Some("done")), ["idle"]);
+        assert_eq!(report_states("unsupported", None), ["unknown"]);
+    }
+
+    #[test]
+    fn disconnect_preserves_completed_status() {
+        assert!(!should_mark_unknown(Some("done")));
+        assert!(should_mark_unknown(Some("working")));
+        assert!(should_mark_unknown(Some("blocked")));
+        assert!(should_mark_unknown(Some("idle")));
+        assert!(should_mark_unknown(None));
     }
 
     /// The `pane_agent_status_changed` event (herdr app/api.rs) must deserialize

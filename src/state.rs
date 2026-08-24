@@ -1,10 +1,10 @@
 // The persisted per-host id map — the heart of reconciliation.
 //
-// remote id → { local id, tombstone, seq, reported }. A tombstone means "the
-// user closed this mirror" — never recreate it until restore. Absence of a
-// remote id means "remote went away" — close the mirror. Restart-idempotent.
-// The camelCase JSON shape matches the TS implementation so an existing
-// <host>-map.json carries over.
+// remote id → { local id, tombstone, seq, reported, last remote status }. A
+// tombstone means "the user closed this mirror" — never recreate it until
+// restore. Absence of a remote id means "remote went away" — close the mirror.
+// Restart-idempotent. The camelCase JSON shape matches the TS implementation so
+// an existing <host>-map.json carries over.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,10 @@ pub struct PaneEntry {
     /// when the remote agent goes away, or it sticks forever
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reported: Option<String>,
+    /// Last remote lifecycle state applied locally. This prevents a reconnect
+    /// from replaying a completed transition as a new completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_remote_status: Option<String>,
 }
 
 impl PaneEntry {
@@ -132,6 +136,7 @@ mod tests {
         assert_eq!(state.tabs["w9:t1"].last_remote_label, None);
         assert_eq!(state.panes["w9:p1"].seq, 12);
         assert_eq!(state.panes["w9:p1"].reported.as_deref(), Some("claude"));
+        assert_eq!(state.panes["w9:p1"].last_remote_status, None);
         assert!(state.panes["wB:p1"].is_tombstoned());
 
         let out = serde_json::to_string(&state).unwrap();
