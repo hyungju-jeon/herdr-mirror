@@ -371,6 +371,19 @@ fn report_states(remote: &str, last_remote: Option<&str>) -> Vec<&'static str> {
     }
 }
 
+/// Keep a completed lifecycle sticky until the remote starts new work.
+///
+/// Herdr can publish an intermediate `idle` or `unknown` snapshot during a
+/// reconnect. Treating that snapshot as a new lifecycle lets the next `done`
+/// replay the synthetic `working -> idle` completion transition.
+fn remembered_remote_status(remote: &str, last_remote: Option<&str>) -> String {
+    if last_remote == Some("done") && matches!(remote, "idle" | "unknown") {
+        "done".to_string()
+    } else {
+        remote.to_string()
+    }
+}
+
 /// Return true when transport loss invalidates the displayed state.
 fn should_mark_unknown(last_remote: Option<&str>) -> bool {
     last_remote != Some("done")
@@ -1539,7 +1552,10 @@ pub async fn push_pane_status(
                 }
             }
             if status_reported {
-                entry.last_remote_status = Some(status.to_string());
+                entry.last_remote_status = Some(remembered_remote_status(
+                    status,
+                    entry.last_remote_status.as_deref(),
+                ));
             }
             // forward the remote's own tokens so a mirrored agent row carries the
             // same values a native one does, under whatever layout is configured
@@ -2203,6 +2219,19 @@ mod tests {
         assert_eq!(report_states("done", Some("working")), ["working", "idle"]);
         assert_eq!(report_states("done", Some("done")), ["idle"]);
         assert_eq!(report_states("unsupported", None), ["unknown"]);
+    }
+
+    /// An intermediate reconnect state must not arm the same completion again.
+    #[test]
+    fn completion_memory_resets_only_when_new_work_starts() {
+        let after_reconnect_idle = remembered_remote_status("idle", Some("done"));
+        assert_eq!(after_reconnect_idle, "done");
+        assert_eq!(report_states("done", Some(&after_reconnect_idle)), ["idle"]);
+        assert_eq!(remembered_remote_status("unknown", Some("done")), "done");
+        assert_eq!(remembered_remote_status("done", Some("done")), "done");
+        assert_eq!(remembered_remote_status("working", Some("done")), "working");
+        assert_eq!(remembered_remote_status("blocked", Some("done")), "blocked");
+        assert_eq!(remembered_remote_status("idle", Some("working")), "idle");
     }
 
     #[test]
