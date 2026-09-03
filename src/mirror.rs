@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::api::ApiClient;
 use crate::config::HostConfig;
-use crate::state::{load_state, save_state, HostState, PaneEntry, TabEntry, WsEntry};
+use crate::state::{load_state, save_state, HostState, PaneEntry, WsEntry};
 use crate::util::{Logger, Result};
 
 // --- snapshot shapes (subset of the API's SessionSnapshot) ---
@@ -244,6 +244,99 @@ fn prune_closed(node: &LayoutNode, panes: &BTreeMap<String, PaneEntry>) -> Optio
                 }),
                 (one, two) => one.or(two),
             }
+        }
+    }
+}
+
+/// Which mirrors `apply_hidden` would close, and what survives the map.
+///
+/// Split out so the gating is testable without a live herdr: the first version
+/// of this closed every mirror on EVERY call because it never read the marker,
+/// which turned the daemon into a destroy/rebuild loop. Full-green tests said
+/// nothing, because nothing reached the function.
+pub(crate) fn hidden_close_plan(
+    hidden: bool,
+    state: &mut HostState,
+    live: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    if !hidden {
+        return Vec::new();
+    }
+    let doomed: Vec<String> = state
+        .workspaces
+        .values()
+        .filter(|e| !e.is_tombstoned() && live.contains(&e.local_id))
+        .map(|e| e.local_id.clone())
+        .collect();
+    if doomed.is_empty() {
+        return doomed;
+    }
+    // tombstones on both maps survive: they mean "the user closed this, do not
+    // recreate until `restore`", which hiding must not quietly forget
+    state.workspaces.retain(|_, e| e.is_tombstoned());
+    state.panes.retain(|_, e| e.is_tombstoned());
+    state.tabs.clear();
+    doomed
+}
+
+/// Take a hidden host's mirrors off the sidebar.
+///
+/// Lives in the daemon and needs only the LOCAL api, so it works while the
+/// remote is unreachable — which is the main reason to hide a connection in the
+/// first place (a dead host leaving reconnecting panes on screen). `converge`
+/// cannot do this job: it only runs while connected, and it is also called by
+/// one-shots whose close tracker nobody reads.
+///
+/// Tombstoned entries are kept. A tombstone means "the user closed this, do not
+/// recreate it until `restore`", and hiding a host must not quietly forget that
+/// — otherwise `show` resurrects every mirror they had deliberately closed.
+///
+/// Two layers against close-through, the same pair `teardown` uses: each id is
+/// marked as ours before its close, and the map entries are dropped first so a
+/// missed mark has nothing to attribute a close to.
+pub async fn apply_hidden(
+    local: &ApiClient,
+    state_dir: &std::path::Path,
+    host_name: &str,
+    log: &Logger,
+    closes: &crate::closes::Closes,
+) {
+    // The guard, not the caller's job: this is called on every host_task loop
+    // and before every connected converge, so without it the daemon closes the
+    // mirrors it just created, forever.
+    let hidden = crate::state::is_hidden(state_dir, host_name);
+    if !hidden {
+        return;
+    }
+    let mut state = load_state(state_dir, host_name);
+    // only ids herdr still shows. Note this filters ids that are GONE, not ids
+    // that now belong to someone else: a local server restart can reassign one,
+    // and this cannot tell. Converge's own close paths share that weakness.
+    let live: std::collections::HashSet<String> = match fetch_snapshot(local).await {
+        Ok(snap) => snap.workspaces.iter().map(|w| w.workspace_id.clone()).collect(),
+        Err(e) => {
+            // the one path where hide legitimately does nothing; say so, or the
+            // mirrors stay up with no explanation anywhere
+            log.log(&format!("hidden: local snapshot failed for {host_name}: {e}"));
+            return;
+        }
+    };
+    let doomed = hidden_close_plan(hidden, &mut state, &live);
+    if doomed.is_empty() {
+        return;
+    }
+    if let Err(e) = save_state(state_dir, host_name, &state) {
+        log.log(&format!("hidden: could not save state for {host_name}: {e}"));
+        return;
+    }
+    for local_id in &doomed {
+        log.log(&format!("hidden — closing mirror workspace {local_id}"));
+        if let Ok(mut t) = closes.lock() {
+            t.mark_self_close(local_id);
+        }
+        if let Err(e) = local.request("workspace.close", json!({ "workspace_id": local_id })).await
+        {
+            log.log(&format!("hidden: close failed for {local_id}: {e}"));
         }
     }
 }
@@ -609,6 +702,32 @@ pub(crate) async fn spawn_streamer_pane(
     argv: &[String],
     log: &Logger,
 ) {
+    let (Some(ssh_target), Some(pane_target)) = (argv.get(2).cloned(), argv.get(3).cloned())
+    else {
+        log.log(&format!("refusing malformed streamer command for {local_pane_id}"));
+        return;
+    };
+    match crate::util::claim_streamer_spawn(
+        state_dir,
+        &ssh_target,
+        &pane_target,
+        local_pane_id,
+    ) {
+        Ok(crate::util::StreamerSpawnClaim::Claimed) => {}
+        Ok(crate::util::StreamerSpawnClaim::Active) => {
+            log.log(&format!("streamer for {pane_target} already active in {local_pane_id}; not retyping"));
+            return;
+        }
+        Ok(crate::util::StreamerSpawnClaim::Pending) => {
+            log.log(&format!("streamer launch for {pane_target} already pending in {local_pane_id}; not retyping"));
+            return;
+        }
+        Err(e) => {
+            log.log(&format!("cannot claim streamer launch for {local_pane_id}: {e}; not retyping"));
+            return;
+        }
+    }
+
     let line = format!(
         "exec {}\n",
         argv.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ")
@@ -617,6 +736,7 @@ pub(crate) async fn spawn_streamer_pane(
         .request("pane.send_text", json!({ "pane_id": local_pane_id, "text": line }))
         .await
     {
+        crate::util::clear_streamer_spawn_pending(state_dir, local_pane_id);
         log.log(&format!("spawn streamer {local_pane_id}: {e}"));
         return;
     }
@@ -628,16 +748,14 @@ pub(crate) async fn spawn_streamer_pane(
     // alive-check right before each resend keeps a late-starting streamer
     // from getting the line typed into its stdin (which would forward it to
     // the remote pane as text).
-    let (Some(ssh_target), Some(pane_target)) = (argv.get(2).cloned(), argv.get(3).cloned())
-    else {
-        return;
-    };
     let (local, log, state_dir) = (local.clone(), log.clone(), state_dir.to_path_buf());
     let pane_id = local_pane_id.to_string();
     tokio::spawn(async move {
         for wait_ms in [3000u64, 4000] {
             tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-            if crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target) {
+            if crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target)
+                || crate::util::pane_streamer_alive(&state_dir, &pane_id)
+            {
                 return;
             }
             log.log(&format!(
@@ -648,11 +766,15 @@ pub(crate) async fn spawn_streamer_pane(
                 .await
                 .is_err()
             {
+                crate::util::clear_streamer_spawn_pending(&state_dir, &pane_id);
                 return; // pane gone (closed meanwhile) — nothing to heal
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
-        if !crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target) {
+        if !crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target)
+            && !crate::util::pane_streamer_alive(&state_dir, &pane_id)
+        {
+            crate::util::clear_streamer_spawn_pending(&state_dir, &pane_id);
             log.log(&format!(
                 "streamer for {pane_target} still not up in {pane_id} after retries — pane left as a shell"
             ));
@@ -681,31 +803,29 @@ fn pane_is_mirror(p: &PaneInfo) -> bool {
     is_marker(&p.foreground_cwd) || is_marker(&p.cwd)
 }
 
-/// Remote tab IDs whose local mirrors received an authoritative close event.
-///
-/// Snapshot absence alone is not enough because it also occurs during local
-/// server restore and failed layout rebuilds.
-fn remote_tabs_closed_locally(
-    tabs: &BTreeMap<String, TabEntry>,
-    local_tab_ids: &HashSet<&str>,
-    remote_tab_ids: &HashSet<&str>,
-    user_closed: &HashSet<String>,
-    close_remote: bool,
-) -> Vec<String> {
-    if !close_remote {
-        return Vec::new();
-    }
-    tabs.iter()
-        .filter(|(remote_id, entry)| {
-            !local_tab_ids.contains(entry.local_id.as_str())
-                && remote_tab_ids.contains(remote_id.as_str())
-                && user_closed.contains(&entry.local_id)
-        })
-        .map(|(remote_id, _)| remote_id.clone())
-        .collect()
-}
-
 // --- the converge pass ---
+
+/// A fresh local id just entered the map (mirror created or adopted). Two
+/// duties, both time-sensitive. Purge any stale user-close recorded against
+/// the id: herdr reuses freed ids, so a close noted before this moment can
+/// only refer to a previous holder, and letting it linger would close-through
+/// the new mirror's REMOTE within USER_CLOSE_TTL. And persist the map right
+/// away instead of at pass end, so the intercept hook's map read (250ms after
+/// pane.created) sees the daemon-built object as mapped instead of judging it
+/// native junk and closing it.
+fn note_mapped(deps: &ConvergeDeps, state: &HostState, fresh_local_ids: &[String]) {
+    if let Ok(mut t) = deps.closes.lock() {
+        for id in fresh_local_ids {
+            t.forget(id);
+        }
+    }
+    if let Err(e) = save_state(&deps.state_dir, &deps.host.name, state) {
+        // Not cosmetic: this write is what tells the intercept hook these
+        // objects are ours. An unwritable state dir would otherwise leave every
+        // daemon-created pane looking like native junk, silently.
+        deps.log.log(&format!("could not persist map after mapping fresh ids: {e}"));
+    }
+}
 
 /// Returns the post-converge state so callers don't re-read the state file.
 pub async fn converge(deps: &ConvergeDeps) -> Result<HostState> {
@@ -719,8 +839,24 @@ pub async fn converge(deps: &ConvergeDeps) -> Result<HostState> {
 async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()> {
     let host = &deps.host;
     let log = &deps.log;
+    // Hidden hosts freeze here and go no further. Deliberately BEFORE the
+    // snapshots: a hidden host should be quiet, not keep paying for two RPCs a
+    // minute forever.
+    //
+    // This branch only freezes; it never closes. Closing has to happen exactly
+    // once, in the process that owns the authoritative close tracker, and
+    // `converge` is called by `once` and other one-shots that carry a throwaway
+    // tracker (see `cmd_once`). Doing the close here meant those marked on a
+    // tracker nobody reads while the daemon's event stream recorded every close
+    // as user intent — which is the chain that closed two real remote
+    // workspaces. The daemon does it in `apply_hidden` instead.
+    if crate::state::is_hidden(&deps.state_dir, &deps.host.name) {
+        return Ok(());
+    }
+
     let (remote_snap, local_snap) =
         tokio::try_join!(fetch_snapshot(&deps.remote), fetch_snapshot(&deps.local))?;
+
 
     let mut local_ws_ids: HashSet<String> =
         local_snap.workspaces.iter().map(|w| w.workspace_id.clone()).collect();
@@ -751,8 +887,8 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         .workspaces
         .values()
         .map(|e| e.local_id.clone())
-        .chain(state.tabs.values().map(|e| e.local_id.clone()))
         .chain(state.panes.values().map(|e| e.local_id.clone()))
+        .chain(state.tabs.values().map(|e| e.local_id.clone()))
         .collect();
     let user_closed = match deps.closes.lock() {
         Ok(mut t) => t.take_user_closed(&mine),
@@ -777,6 +913,8 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     }
     let pane_ws: HashMap<&str, &str> =
         remote_snap.panes.iter().map(|p| (p.pane_id.as_str(), p.workspace_id.as_str())).collect();
+    let pane_tab: HashMap<&str, &str> =
+        remote_snap.panes.iter().map(|p| (p.pane_id.as_str(), p.tab_id.as_str())).collect();
     let mut drop_panes: Vec<String> = Vec::new();
     let mut pane_close_remote: Vec<String> = Vec::new();
     for (rid, entry) in state.panes.iter_mut() {
@@ -788,7 +926,14 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             match ws_entry {
                 Some(w) if !w.is_tombstoned() && local_ws_ids.contains(&w.local_id) => {
                     entry.tombstone = Some(true);
-                    if close_remote && user_closed.contains(&entry.local_id) {
+                    // user intent covers the pane itself AND its whole tab:
+                    // closing a tab emits only tab_closed, so the panes inside
+                    // it are claimed through their tab's mapped local id
+                    let tab_closed = pane_tab
+                        .get(rid.as_str())
+                        .and_then(|t| state.tabs.get(*t))
+                        .is_some_and(|e| user_closed.contains(&e.local_id));
+                    if close_remote && (user_closed.contains(&entry.local_id) || tab_closed) {
                         pane_close_remote.push(rid.clone());
                     } else {
                         log.log(&format!("pane mirror for {rid} was closed locally — tombstoning"));
@@ -806,23 +951,6 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     }
     for rid in drop_panes {
         state.panes.remove(&rid);
-    }
-    // A tab has no tombstone because closing it also closes all of its panes.
-    // Close the remote tab only when the local event stream proves that the
-    // missing local tab was a user action.
-    let tab_close_remote = remote_tabs_closed_locally(
-        &state.tabs,
-        &local_tab_ids,
-        &remote_tab_ids,
-        &user_closed,
-        close_remote,
-    );
-    for rid in &tab_close_remote {
-        log.log(&format!("tab mirror for {rid} closed locally — closing remote tab"));
-        if let Err(e) = deps.remote.request("tab.close", json!({ "tab_id": rid })).await {
-            log.log(&format!("remote tab close failed for {rid}: {e}"));
-        }
-        state.tabs.remove(rid);
     }
 
     // 2. remote objects that disappeared → close their mirrors. Explicit
@@ -997,7 +1125,11 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 }
             };
             local_ws_ids.insert(entry.local_id.clone());
+            let fresh: Vec<String> = std::iter::once(entry.local_id.clone())
+                .chain(entry.root_tab_local_id.clone())
+                .collect();
             state.workspaces.insert(rws.workspace_id.clone(), entry);
+            note_mapped(deps, state, &fresh);
         }
     }
 
@@ -1051,11 +1183,6 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
 
     // 4. remote tabs → replicate layout with wrapper commands
     for rtab in &remote_snap.tabs {
-        // The snapshot was taken before the close request above. Do not rebuild
-        // a local mirror from that stale snapshot.
-        if tab_close_remote.contains(&rtab.tab_id) {
-            continue;
-        }
         let Some(ws_entry) = state.workspaces.get(&rtab.workspace_id).cloned() else { continue };
         if ws_entry.is_tombstoned() {
             continue;
@@ -1127,6 +1254,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     ws.root_tab_local_id = None;
                 }
                 // applied with `tab_label: rtab.label`, so the two agree from birth
+                let mut fresh = vec![applied.layout.tab_id.clone()];
                 state.tabs.insert(
                     rtab.tab_id.clone(),
                     crate::state::TabEntry {
@@ -1136,6 +1264,10 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 );
                 let mut local_order = Vec::new();
                 walk_pane_ids(&applied.layout.root, &mut local_order);
+                // map every pane first and persist, THEN exec streamers: the
+                // panes already exist (layout.apply made them), so the map
+                // write must not wait behind the send_text round-trips
+                let mut to_spawn: Vec<(String, String)> = Vec::new();
                 for (i, rid) in remote_order.iter().enumerate() {
                     if rid.is_empty() || local_order.get(i).is_none_or(|l| l.is_empty()) {
                         continue;
@@ -1152,8 +1284,13 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                             last_remote_status: None,
                         },
                     );
+                    fresh.push(local_id.clone());
+                    to_spawn.push((local_id, rid.clone()));
+                }
+                note_mapped(deps, state, &fresh);
+                for (local_id, rid) in &to_spawn {
                     // plain pane created above; exec the streamer into it
-                    spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(rid), &deps.log).await;
+                    spawn_streamer_pane(&deps.local, &deps.state_dir, local_id, &cmd_for(rid), &deps.log).await;
                 }
             } else {
                 // tab exists — add mirrors for individual new remote panes as
@@ -1208,18 +1345,22 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                             )
                             .await;
                     }
-                    spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&place.pane), &deps.log)
-                        .await;
+                    // map + persist BEFORE the streamer exec: the pane exists
+                    // as of pane.split above, and the intercept hook judges
+                    // unmapped placeholder panes 250ms after pane.created
                     state.panes.insert(
                         place.pane.clone(),
                         PaneEntry {
-                            local_id,
+                            local_id: local_id.clone(),
                             tombstone: None,
                             seq: 0,
                             reported: None,
                             last_remote_status: None,
                         },
                     );
+                    note_mapped(deps, state, std::slice::from_ref(&local_id));
+                    spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&place.pane), &deps.log)
+                        .await;
                 }
                 // A pane whose remote sibling is a multi-pane subtree can't be
                 // reproduced: pane.split splits a leaf, and nothing wraps a
@@ -1249,18 +1390,19 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     ));
                     let local_id =
                         split_mirror_pane(&deps.local, &target, &direction, None, &cwd).await?;
-                    spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&rp.pane_id), &deps.log)
-                        .await;
                     state.panes.insert(
                         rp.pane_id.clone(),
                         PaneEntry {
-                            local_id,
+                            local_id: local_id.clone(),
                             tombstone: None,
                             seq: 0,
                             reported: None,
                             last_remote_status: None,
                         },
                     );
+                    note_mapped(deps, state, std::slice::from_ref(&local_id));
+                    spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&rp.pane_id), &deps.log)
+                        .await;
                 }
             }
         }
@@ -1552,6 +1694,10 @@ pub async fn teardown(
     // remote. Manual close is unaffected: there the entry is still mapped when
     // the user closes it, so the intent still reaches the remote.
     save_state(state_dir, host_name, &HostState::default())?;
+    // teardown means "stop mirroring here entirely", which supersedes hide —
+    // leaving the marker would make a later `start` bring back nothing with no
+    // explanation of why
+    let _ = crate::state::set_hidden(state_dir, host_name, false);
     for entry in state.workspaces.values() {
         log.log(&format!("closing mirror workspace {}", entry.local_id));
         // ours, not the user's: the heal re-adopts these ids, so without the mark
@@ -1650,6 +1796,46 @@ pub async fn regroup_sidebar(local: &ApiClient, prefixes: &[String], log: &Logge
 
 #[cfg(test)]
 mod tests {
+    use super::hidden_close_plan;
+
+    fn ws_entry(local: &str, tomb: bool) -> WsEntry {
+        WsEntry {
+            local_id: local.into(),
+            tombstone: tomb.then_some(true),
+            root_tab_local_id: None,
+            last_remote_label: None,
+        }
+    }
+
+    fn live(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The bug that made the daemon close the mirrors it had just created, on
+    /// every pass, for every host. It shipped past a full-green suite because
+    /// nothing exercised the gate.
+    #[test]
+    fn a_host_that_is_not_hidden_is_never_touched() {
+        let mut state = HostState::default();
+        state.workspaces.insert("R1".into(), ws_entry("w7", false));
+        let doomed = hidden_close_plan(false, &mut state, &live(&["w7"]));
+        assert!(doomed.is_empty(), "closed a mirror on a host nobody hid");
+        assert_eq!(state.workspaces.len(), 1, "map must survive untouched");
+    }
+
+    #[test]
+    fn hiding_closes_live_mirrors_and_keeps_tombstones() {
+        let mut state = HostState::default();
+        state.workspaces.insert("R1".into(), ws_entry("w7", false));
+        state.workspaces.insert("R2".into(), ws_entry("w8", true)); // user closed it
+        state.workspaces.insert("R3".into(), ws_entry("w9", false)); // already gone
+        let doomed = hidden_close_plan(true, &mut state, &live(&["w7", "w8"]));
+        assert_eq!(doomed, vec!["w7".to_string()], "only the live, non-tombstoned one");
+        // the tombstone survives, or `show` resurrects a mirror the user closed
+        assert!(state.workspaces.contains_key("R2"));
+        assert!(!state.workspaces.contains_key("R1"));
+        assert!(!state.workspaces.contains_key("R3"));
+    }
     use super::*;
 
     fn string_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
@@ -1710,30 +1896,6 @@ mod tests {
             reported: None,
             last_remote_status: None,
         }
-    }
-
-    #[test]
-    fn remote_tab_close_requires_local_event_and_live_remote_tab() {
-        let tabs = BTreeMap::from([
-            (
-                "rt1".into(),
-                TabEntry { local_id: "lt1".into(), last_remote_label: None },
-            ),
-            (
-                "rt2".into(),
-                TabEntry { local_id: "lt2".into(), last_remote_label: None },
-            ),
-        ]);
-        let local = HashSet::from(["lt2"]);
-        let remote = HashSet::from(["rt1", "rt2"]);
-        let closed = HashSet::from(["lt1".to_string()]);
-
-        assert_eq!(
-            remote_tabs_closed_locally(&tabs, &local, &remote, &closed, true),
-            vec!["rt1".to_string()]
-        );
-        assert!(remote_tabs_closed_locally(&tabs, &local, &remote, &HashSet::new(), true).is_empty());
-        assert!(remote_tabs_closed_locally(&tabs, &local, &remote, &closed, false).is_empty());
     }
 
     /// A locally-closed (tombstoned) pane must not survive into the tree a tab

@@ -9,6 +9,9 @@ and drive.
   <img src="assets/hero.png" width="720" alt="herdr-mirror: local and remote herdr sessions unified in one window">
 </p>
 
+> 🐾 Check out my other plugin: [herdr-pet](https://github.com/nikok6/herdr-pet), a tiny
+> desk pet on your panes that types, waits, and celebrates with your agent.
+
 Each remote workspace becomes a real local workspace named `<host>: <name>`.
 Its panes stream the remote terminal live; its agents report their real state.
 Mirroring is one-way (the remote needs no plugin — just herdr), but you can
@@ -88,13 +91,18 @@ read-only: a live view with zero effect on the remote that escalates to control
 when you type and auto-releases after 1h idle (`ctrl+\` releases immediately).
 
 **Close / restore** — by default, closing a mirror (`prefix+x`) also closes the
-pane/workspace on the remote (`close_remote_on_local_close`; set it false to
+pane/tab/workspace on the remote (`close_remote_on_local_close`; set it false to
 only stop mirroring and leave the remote — and its agent — running). When the
 remote is left running, the **restore** action (`herdr-mirror restore`) brings
 back mirrors you closed.
 
 **Pause** — the **pause** action halts syncing; mirrors stay frozen in place
 and resume with **start**. `teardown` closes all mirrors and clears state.
+
+**Hide / show** — **hide** takes a connection's mirrors off the sidebar and
+leaves the remote untouched: its workspaces, panes and agents keep running.
+**show** brings them back. Both act on one host: name it (`herdr-mirror hide
+work`), or invoke them inside a mirror to take that mirror's host.
 
 **Recover frozen panes** — after Herdr restores a session, a mirror pane can
 return as a plain shell without its streamer. Run the **recover** action or
@@ -107,6 +115,16 @@ inheriting the target host and cwd from the mirror you invoke them from (the
 same rule as native `prefix+shift+n`, but remote): `remote-new-workspace`,
 `remote-new-tab`, `remote-split-right`, `remote-split-down`. The new object
 mirrors back within seconds.
+
+**Native keys inside a mirror** — creating a tab or a split with herdr's own
+keys while focused on a mirror pane creates it on the remote, instead of
+dropping a local terminal into the mirrored workspace. The local object closes
+as it appears, the mirror pane says so in its status row, and the remote one
+mirrors back seconds later. A native new workspace opens the host picker.
+Nothing outside a mirror workspace is affected.
+
+**Pick a host** — `new-workspace-pick` opens that picker on demand: this
+machine, or any configured host.
 
 **One key for both worlds** — outside a mirror they degrade to the plain local
 action instead of erroring, so one binding can replace the native key entirely.
@@ -152,6 +170,21 @@ command = "mirror.restore"     # un-close mirrors you closed locally
 key = "prefix+alt+d"           # destructive: closes ALL mirrors + clears state
 type = "plugin_action"
 command = "mirror.teardown"    # stop mirroring everything (start to resume)
+
+[[keys.command]]
+key = "prefix+alt+h"
+type = "plugin_action"
+command = "mirror.hide"        # take a host's mirrors off the sidebar
+
+[[keys.command]]
+key = "prefix+alt+shift+h"
+type = "plugin_action"
+command = "mirror.show"        # and put them back
+
+[[keys.command]]
+key = "prefix+shift+n"         # native new_workspace, now with a host to pick
+type = "plugin_action"
+command = "mirror.new-workspace-pick"
 
 # Create objects on the REMOTE host, or locally when invoked outside a mirror.
 # Each is herdr's native local key + alt (Option): same muscle memory, remote
@@ -270,20 +303,9 @@ markers for a file drop. The path must identify an existing local regular file.
 
 ### Mouse
 
-Mirror panes adapt to what's running on the remote pane:
-
-- at a **shell**, the mouse stays local — drag-select and copy work natively, and
-  nothing leaks into the prompt;
-- in a **TUI** (vim, htop, lazygit, …), a plain left drag selects the rendered
-  text and copies it on release, while a left click and other mouse buttons
-  forward to the app;
-- hold **Ctrl** during a left drag to forward the complete drag to the remote
-  TUI. Wheel events always use semantic remote scrolling.
-
-herdr's streamed frames don't carry the app's mouse mode, so the plugin infers it
-from the remote pane's foreground process — anything that isn't a known shell is
-treated as a mouse-aware TUI. Detection is polled, so after switching between a
-shell and a TUI there's a brief lag before the mouse mode catches up.
+- **Drag to select, release to copy** — The text reaches your own clipboard, even over ssh.
+- **Everything else goes to the program on the remote** — the wheel, right and
+  middle click, and a plain click that isn't a drag.
 
 ## Configuration
 
@@ -297,10 +319,10 @@ shell and a TUI there's a brief lag before the mouse mode catches up.
 # default_host = "work"  # host that "new remote workspace" targets when
                          # invoked outside any mirror (default: first host)
 # close_remote_on_local_close = true
-                         # default. Closing a mirror pane/workspace locally
-                         # (e.g. prefix+x) also closes it on the remote. Set
-                         # false to only stop mirroring on a local close,
-                         # leaving the remote pane and its agent running.
+                         # default. Closing a mirror pane/tab/workspace
+                         # locally (e.g. prefix+x) also closes it on the
+                         # remote. Set false to only stop mirroring on a local
+                         # close, leaving the remote pane and its agent running.
 # remote_focus_actions = []
                          # remote plugin actions to run after a mirror workspace
                          # receives local focus, for example

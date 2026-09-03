@@ -4,6 +4,8 @@
 //   herdr-mirror daemon                 # control plane (foreground; `start` spawns this)
 //   herdr-mirror pane <host> <target>   # data plane: one per mirror pane
 //   herdr-mirror start|pause|recover|ensure|status|once|restore|teardown|paste-image
+//   herdr-mirror hide|show [host]       # toggle a connection's mirrors out of view
+//   herdr-mirror pick-workspace [--menu]            # popup host picker
 //   herdr-mirror remote-workspace|remote-tab|remote-split <right|down>
 //   herdr-mirror remote-invoke <plugin>.<action>
 //   herdr-mirror remote-actions [host]              # discovery
@@ -21,9 +23,11 @@ mod layout_sync;
 mod mirror;
 mod pane;
 mod paste;
+mod pick;
 mod predict;
 mod remote;
 mod remote_action;
+mod select;
 mod ssh_relay;
 mod state;
 mod util;
@@ -87,9 +91,23 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             rest.get(2).map(String::as_str),
         ),
         "teardown" => rt.block_on(daemon::cmd_teardown(Env::resolve()?)),
+        "hide" => rt.block_on(remote_action::hide_cmd(Env::resolve()?, rest.get(1).map(String::as_str))),
+        "show" => rt.block_on(remote_action::show_cmd(Env::resolve()?, rest.get(1).map(String::as_str))),
         "pane" => {
             let args = pane::parse_args(&rest[1..])?;
             rt.block_on(pane::run(args))
+        }
+        "pick-workspace" => {
+            if rest.iter().any(|a| a == "--menu") {
+                pick::menu(rt, Env::resolve()?)
+            } else {
+                rt.block_on(pick::summon(Env::resolve()?))
+            }
+        }
+        "intercept-new" => {
+            // creation hooks — cheap, silent no-op when nothing matches
+            let what = rest.get(1).map(String::as_str).unwrap_or("workspace");
+            rt.block_on(pick::intercept(Env::resolve()?, what))
         }
         "remote-workspace" => rt.block_on(remote_action::run_cmd(Env::resolve()?, "workspace", None)),
         "remote-tab" => rt.block_on(remote_action::run_cmd(Env::resolve()?, "tab", None)),
@@ -119,7 +137,7 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             rt.block_on(binding::unbind(Env::resolve()?, what))
         }
         other => Err(util::err(format!(
-            "unknown command: {other} (daemon|pane|start|pause|recover|ensure|status|once|restore|teardown|paste-image|remote-workspace|remote-tab|remote-split|remote-invoke|remote-actions|bind|unbind)"
+            "unknown command: {other} (daemon|pane|start|pause|recover|ensure|status|once|restore|teardown|paste-image|hide|show|pick-workspace|remote-workspace|remote-tab|remote-split|remote-invoke|remote-actions|bind|unbind)"
         ))),
     }
 }

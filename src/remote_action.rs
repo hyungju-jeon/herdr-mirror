@@ -319,6 +319,17 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
     // mirrored we still go remote, never dropping a local object into a
     // daemon-owned workspace.
     if resolved.is_none() {
+        // The intercept hook opts out: it calls us from INSIDE a mirror
+        // workspace, having just closed a local object there, so degrading to a
+        // local create would put back exactly what it removed — and drop an
+        // unmirrored pane into a daemon-owned tab, which the comment above says
+        // never happens. Erroring is honest; `report_failure` surfaces it.
+        if std::env::var(crate::pick::NO_LOCAL_FALLBACK_ENV).is_ok() {
+            return Err(err(
+                "could not resolve the mirror host for this workspace; refusing to create a local object inside it"
+                    .to_string(),
+            ));
+        }
         match kind {
             "tab" => return local_tab(env, &ctx).await,
             // direction was validated at the top of this fn
@@ -394,6 +405,131 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
         _ => return Err(err(format!("unknown remote action: {kind}"))),
     }
     Ok(())
+}
+
+/// Host for `hide`/`show`: an explicit name is looked up directly (same
+/// unknown-host error shape as `remote-actions`); omitted, it falls back to
+/// the invocation context like `remote-tab`/`remote-split` do, so a key bound
+/// inside a mirror workspace hides/shows whichever connection it's pressed in.
+async fn resolve_host(env: &Env, host_arg: Option<&str>) -> Result<HostConfig> {
+    let config = load_config(&env.config_search)?;
+    if let Some(name) = host_arg {
+        return config.hosts.iter().find(|h| h.name == name).cloned().ok_or_else(|| {
+            let known: Vec<&str> = config.hosts.iter().map(|h| h.name.as_str()).collect();
+            err(format!(
+                "unknown host {name:?} (configured: {})",
+                if known.is_empty() { "none".into() } else { known.join(", ") }
+            ))
+        });
+    }
+    let ctx = invocation_context();
+    resolve_context(env, &config.hosts, &ctx).map(|r| r.host).ok_or_else(|| {
+        err("no host given and not invoked from inside a mirror workspace — pass one: herdr-mirror hide <host>")
+    })
+}
+
+pub async fn hide_cmd(env: Env, host_arg: Option<&str>) -> Result<()> {
+    report_failure(&env, "hide", hide(&env, host_arg).await).await
+}
+
+pub async fn show_cmd(env: Env, host_arg: Option<&str>) -> Result<()> {
+    report_failure(&env, "show", show(&env, host_arg).await).await
+}
+
+async fn hide(env: &Env, host_arg: Option<&str>) -> Result<()> {
+    let host = resolve_host(env, host_arg).await?;
+    let already = crate::state::is_hidden(&env.state_dir, &host.name);
+    crate::state::set_hidden(&env.state_dir, &host.name, true)
+        .map_err(|e| err(format!("could not mark {} hidden: {e}", host.name)))?;
+    // The daemon does the closing (mirror::apply_hidden): it owns the close
+    // tracker, and an unmarked close is read back as user intent, which
+    // close-through then aims at the remote once `show` rebuilds the mirrors
+    // onto ids herdr has recycled. Re-poke even when already hidden: the last
+    // hide may not have landed (daemon down, or it was still starting), and
+    // "already hidden" with the mirrors still on screen is a dead end.
+    match crate::daemon::running_pid(env) {
+        Some(pid) => {
+            unsafe { libc::kill(pid, libc::SIGUSR1) };
+            println!(
+                "hid {} — remote keeps running; `herdr-mirror show {}` brings it back",
+                host.name, host.name
+            );
+        }
+        None => {
+            println!(
+                "{} hidden — mirrors disappear when the daemon starts (`herdr-mirror start`)",
+                host.name
+            );
+            return Ok(());
+        }
+    }
+    if already {
+        println!("({} was already hidden — re-poked the daemon)", host.name);
+    }
+    Ok(())
+}
+
+async fn show(env: &Env, host_arg: Option<&str>) -> Result<()> {
+    if let Some(name) = host_arg {
+        let host = resolve_host(env, Some(name)).await?;
+        return show_one(env, &host).await;
+    }
+    // No argument. The invocation context can only ever name a host that is
+    // VISIBLE — a hidden one has no mapped workspace to resolve against — so a
+    // context hit that is not hidden must fall through to "show everything",
+    // or the key bound inside one mirror can never bring back another host.
+    let config = load_config(&env.config_search)?;
+    let ctx = invocation_context();
+    if let Some(host) = resolve_context(env, &config.hosts, &ctx).map(|r| r.host) {
+        if crate::state::is_hidden(&env.state_dir, &host.name) {
+            return show_one(env, &host).await;
+        }
+    }
+    show_all(env).await
+}
+
+fn clear_hidden(env: &Env, host: &HostConfig) -> Result<bool> {
+    if !crate::state::is_hidden(&env.state_dir, &host.name) {
+        return Ok(false);
+    }
+    crate::state::set_hidden(&env.state_dir, &host.name, false)
+        .map_err(|e| err(format!("could not un-hide {}: {e}", host.name)))?;
+    Ok(true)
+}
+
+async fn show_one(env: &Env, host: &HostConfig) -> Result<()> {
+    if !clear_hidden(env, host)? {
+        println!("{} is not hidden", host.name);
+        return Ok(());
+    }
+    nudge_daemon(env, &format!("showing {}", host.name));
+    Ok(())
+}
+
+async fn show_all(env: &Env) -> Result<()> {
+    let config = load_config(&env.config_search)?;
+    let mut shown = Vec::new();
+    for h in &config.hosts {
+        if clear_hidden(env, h)? {
+            shown.push(h.name.clone());
+        }
+    }
+    if shown.is_empty() {
+        println!("no hidden hosts");
+        return Ok(());
+    }
+    nudge_daemon(env, &format!("showing {}", shown.join(", ")));
+    Ok(())
+}
+
+fn nudge_daemon(env: &Env, prefix: &str) {
+    match crate::daemon::running_pid(env) {
+        Some(pid) => {
+            unsafe { libc::kill(pid, libc::SIGUSR1) };
+            println!("{prefix} — daemon syncing now");
+        }
+        None => println!("{prefix} — mirrors reappear when the daemon starts"),
+    }
 }
 
 #[cfg(test)]
