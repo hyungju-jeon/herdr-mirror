@@ -386,7 +386,7 @@ fn remembered_remote_status(remote: &str, last_remote: Option<&str>) -> String {
 
 /// Return true when transport loss invalidates the displayed state.
 fn should_mark_unknown(last_remote: Option<&str>) -> bool {
-    last_remote != Some("done")
+    !matches!(last_remote, Some("idle") | Some("done"))
 }
 
 pub fn mirror_source(host_name: &str) -> String {
@@ -2214,11 +2214,12 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_preserves_completed_status() {
+    fn disconnect_preserves_terminal_status() {
+        assert!(!should_mark_unknown(Some("idle")));
         assert!(!should_mark_unknown(Some("done")));
         assert!(should_mark_unknown(Some("working")));
         assert!(should_mark_unknown(Some("blocked")));
-        assert!(should_mark_unknown(Some("idle")));
+        assert!(should_mark_unknown(Some("unknown")));
         assert!(should_mark_unknown(None));
     }
 
