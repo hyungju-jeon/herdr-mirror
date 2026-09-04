@@ -6,7 +6,7 @@
 // Restart-idempotent. The camelCase JSON shape matches the TS implementation so
 // an existing <host>-map.json carries over.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,11 @@ pub struct WsEntry {
     /// (push the rename to the remote instead of stomping it)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_remote_label: Option<String>,
+    /// Token names this mirror source last forwarded. Herdr token values are
+    /// global by name, so retraction must never infer ownership from the full
+    /// local workspace token map.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub forwarded_tokens: BTreeSet<String>,
 }
 
 impl WsEntry {
@@ -188,7 +193,7 @@ mod tests {
     fn ts_state_shape_roundtrips() {
         let ts = r#"{
  "workspaces": {
-  "w9": { "localId": "w1234", "rootTabLocalId": "t99" },
+  "w9": { "localId": "w1234", "rootTabLocalId": "t99", "forwardedTokens": ["rbranch", "t1"] },
   "wB": { "localId": "w5678", "tombstone": true }
  },
  "tabs": { "w9:t1": { "localId": "t42" } },
@@ -201,6 +206,11 @@ mod tests {
         assert_eq!(state.workspaces["w9"].local_id, "w1234");
         assert_eq!(state.workspaces["w9"].root_tab_local_id.as_deref(), Some("t99"));
         assert!(state.workspaces["wB"].is_tombstoned());
+        assert_eq!(
+            state.workspaces["w9"].forwarded_tokens,
+            BTreeSet::from(["rbranch".into(), "t1".into()])
+        );
+        assert!(state.workspaces["wB"].forwarded_tokens.is_empty());
         // a tab mapped before label history existed loads with none, which the
         // resolver reads as "remote wins once"
         assert_eq!(state.tabs["w9:t1"].last_remote_label, None);

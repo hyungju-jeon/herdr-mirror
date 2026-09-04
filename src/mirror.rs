@@ -6,7 +6,7 @@
 // mirror locally" (tombstone — don't recreate) from "remote object went away"
 // (close the mirror).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -393,21 +393,25 @@ pub fn mirror_source(host_name: &str) -> String {
     format!("plugin:mirror:{host_name}")
 }
 
-/// Retract forwarded token names that are absent from the remote token set.
+/// Build the workspace-token patch for one remote snapshot.
 ///
-/// `workspace.report_metadata` merges updates, so tokens that disappeared on
-/// the remote must be sent as `null`; omission would leave closed-tab labels in
-/// the local sidebar. Local-only token names are safe to retract because the
-/// request applies only to this mirror's metadata source.
-fn workspace_token_retractions(
+/// Set every current remote value and clear only names this mirror forwarded
+/// before. Herdr stores token values globally by name; the source identifies
+/// sequence ordering, not ownership of a separate token map.
+fn workspace_token_patch(
     remote: &HashMap<String, String>,
-    local: &HashMap<String, String>,
+    forwarded: &BTreeSet<String>,
 ) -> HashMap<String, Option<String>> {
-    local
-        .keys()
-        .filter(|name| !remote.contains_key(*name))
-        .map(|name| (name.clone(), None))
-        .collect()
+    let mut patch: HashMap<String, Option<String>> = remote
+        .iter()
+        .map(|(name, value)| (name.clone(), Some(value.clone())))
+        .collect();
+    for name in forwarded {
+        if !remote.contains_key(name) {
+            patch.insert(name.clone(), None);
+        }
+    }
+    patch
 }
 
 /// The server rejects custom_status longer than this.
@@ -1106,6 +1110,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         None
                     },
                     last_remote_label: Some(rws.label.clone()),
+                    forwarded_tokens: BTreeSet::new(),
                 }
             } else {
                 log.log(&format!("creating mirror workspace {label}"));
@@ -1135,6 +1140,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     tombstone: None,
                     root_tab_local_id: Some(created.tab.tab_id),
                     last_remote_label: Some(rws.label.clone()),
+                    forwarded_tokens: BTreeSet::new(),
                 }
             };
             local_ws_ids.insert(entry.local_id.clone());
@@ -1154,43 +1160,24 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         let Some(remote_tokens) = rws.tokens.as_ref() else {
             continue; // pre-0.7.4 remote: absence is not an authoritative empty set
         };
-        let Some(entry) = state.workspaces.get(&rws.workspace_id) else { continue };
+        let Some(entry) = state.workspaces.get_mut(&rws.workspace_id) else { continue };
         if entry.is_tombstoned() || !local_ws_ids.contains(&entry.local_id) {
             continue;
         }
-        let local_tokens = local_snap
-            .workspaces
-            .iter()
-            .find(|ws| ws.workspace_id == entry.local_id)
-            .and_then(|ws| ws.tokens.as_ref())
-            .cloned()
-            .unwrap_or_default();
-        let retractions = workspace_token_retractions(remote_tokens, &local_tokens);
-        if !retractions.is_empty() {
-            let _ = deps
-                .local
-                .request(
-                    "workspace.report_metadata",
-                    json!({
-                        "workspace_id": entry.local_id,
-                        "source": source,
-                        "tokens": retractions,
-                    }),
-                )
-                .await;
+        let patch = workspace_token_patch(remote_tokens, &entry.forwarded_tokens);
+        if patch.is_empty() {
+            continue;
         }
-        if !remote_tokens.is_empty() {
-            let _ = deps
-                .local
-                .request(
-                    "workspace.report_metadata",
-                    json!({
-                        "workspace_id": entry.local_id,
-                        "source": source,
-                        "tokens": remote_tokens,
-                    }),
-                )
-                .await;
+        match deps
+            .local
+            .request(
+                "workspace.report_metadata",
+                json!({ "workspace_id": entry.local_id, "source": source, "tokens": patch }),
+            )
+            .await
+        {
+            Ok(_) => entry.forwarded_tokens = remote_tokens.keys().cloned().collect(),
+            Err(e) => log.log(&format!("workspace metadata {}: {e}", entry.local_id)),
         }
     }
 
@@ -1820,6 +1807,7 @@ mod tests {
             tombstone: tomb.then_some(true),
             root_tab_local_id: None,
             last_remote_label: None,
+            forwarded_tokens: BTreeSet::new(),
         }
     }
 
@@ -1957,24 +1945,15 @@ mod tests {
     }
 
     #[test]
-    fn workspace_token_retractions_include_a_closed_remote_tab() {
-        let remote = string_map(&[("t1", "remaining tab"), ("rbranch", "main")]);
-        let local =
-            string_map(&[("t1", "remaining tab"), ("t2", "closed tab"), ("rbranch", "main")]);
+    fn workspace_token_patch_clears_only_names_forwarded_before() {
+        let remote = string_map(&[("t1", "remaining tab")]);
+        let forwarded = BTreeSet::from(["t1".into(), "t2".into()]);
 
-        let retractions = workspace_token_retractions(&remote, &local);
+        let patch = workspace_token_patch(&remote, &forwarded);
 
-        assert_eq!(retractions, HashMap::from([("t2".into(), None)]));
-    }
-
-    #[test]
-    fn authoritative_empty_workspace_tokens_retract_all_local_tokens() {
-        let local = string_map(&[("t1", "closed tab"), ("rbranch", "main")]);
-
-        let retractions = workspace_token_retractions(&HashMap::new(), &local);
-
-        assert_eq!(retractions.get("t1"), Some(&None));
-        assert_eq!(retractions.get("rbranch"), Some(&None));
+        assert_eq!(patch.get("t1"), Some(&Some("remaining tab".into())));
+        assert_eq!(patch.get("t2"), Some(&None));
+        assert!(!patch.contains_key("local-only"));
     }
 
     #[test]

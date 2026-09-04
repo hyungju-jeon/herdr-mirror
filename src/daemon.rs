@@ -1033,6 +1033,7 @@ mod tests {
                 tombstone: None,
                 root_tab_local_id: None,
                 last_remote_label: None,
+                forwarded_tokens: Default::default(),
             },
         );
         state.workspaces.insert(
@@ -1042,6 +1043,7 @@ mod tests {
                 tombstone: Some(true),
                 root_tab_local_id: None,
                 last_remote_label: None,
+                forwarded_tokens: Default::default(),
             },
         );
 
